@@ -8,6 +8,10 @@
  * Each unit type is one instanced mesh per side, and all health bars and all
  * ground decals are one draw call each, so a full battlefield costs about
  * thirty draw calls however many units are on it.
+ *
+ * The two heroes are the exception: each is a small rig of hinged parts that
+ * strides, swings its sword and wears its buffs (Aegis sphere, rune auras,
+ * the Lifesteal Blade's crimson wisps).
  */
 
 import * as THREE from 'three';
@@ -128,6 +132,17 @@ const MODELS = {
 /* Shaders                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The hand-written shaders work in display (sRGB) colours. The frame is linear
+ * HDR, so each one decodes its result with this before the standard output conversion.
+ */
+export const GLSL_TO_LINEAR = /* glsl */ `
+vec3 toLinear(vec3 c) {
+  c = max(c, 0.0);
+  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
+}
+`;
+
 /** Camera-facing quads: X is screen-right and the camera's up vector tilts with its pitch. */
 const barVertex = (sinPitch, cosPitch) => /* glsl */ `
 attribute vec3 aAnchor;
@@ -149,13 +164,15 @@ const BAR_FRAGMENT = /* glsl */ `
 varying vec2 vUv;
 varying vec4 vFill;
 varying float vAspect;
+${GLSL_TO_LINEAR}
 void main() {
   float frameX = 0.2 / vAspect;
   vec2 edge = min(vUv, 1.0 - vUv);
   float inner = (vUv.x - frameX) / (1.0 - 2.0 * frameX);
   vec3 col = inner <= vFill.a ? vFill.rgb * (0.65 + 0.7 * vUv.y) : vec3(0.05, 0.06, 0.1);
   if (edge.y < 0.2 || edge.x < frameX) col = vec3(0.0);
-  gl_FragColor = vec4(col, 0.95);
+  gl_FragColor = vec4(toLinear(col), 0.95);
+  #include <colorspace_fragment>
 }
 `;
 
@@ -178,12 +195,14 @@ const DECAL_FRAGMENT = /* glsl */ `
 varying vec2 vUv;
 varying vec4 vParams;
 varying vec3 vTint;
+${GLSL_TO_LINEAR}
 void main() {
   float r = length(vUv - 0.5) * 2.0;
   float a = vParams.y < 0.5 ? smoothstep(1.0, 0.25, r)
           : vParams.y < 1.5 ? smoothstep(0.1, 0.03, abs(r - 0.86))
           : smoothstep(0.014, 0.004, abs(r - 0.98));
-  gl_FragColor = vec4(vTint, a * vParams.z);
+  gl_FragColor = vec4(toLinear(vTint), a * vParams.z);
+  #include <colorspace_fragment>
 }
 `;
 
@@ -218,12 +237,15 @@ function turn(from, to, amount) {
  * @param kit.scene          scene to draw into
  * @param kit.Batch, kit.pen, kit.lean   geometry helpers from battlefield.js
  * @param kit.heroes         hero models built by the battlefield, by side
- * @param kit.fx             effect primitives: bolt, ray, slam, sparks, ring, flash, beam
+ * @param kit.fx             effect primitives: bolt, ray, slam, sparks, ring, flash, beam, rise, heroSlash, drain, shieldBreak
+ * @param kit.colors         { spell: by side, rune: by kind, lifesteal }
+ * @param kit.glowTexture    soft round sprite texture
  * @param kit.structurePoint id (negative) -> aim point on a Tower or Throne, or null if it has fallen
  */
-export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMaterial, pitch, heroes, fx, structurePoint }) {
+export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMaterial, pitch, heroes, fx, colors, glowTexture, structurePoint }) {
   const sinPitch = Math.sin(pitch);
   const cosPitch = Math.cos(pitch);
+  const tanPitch = Math.tan(pitch);
 
   /* ---------------------------------------------------------------- Instanced unit meshes */
 
@@ -244,6 +266,7 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
         mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
         mesh.count = 0;
         mesh.frustumCulled = false;
+        mesh.castShadow = i === 0;
         mesh.receiveShadow = i === 0;
         scene.add(mesh);
         return mesh;
@@ -301,21 +324,48 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
 
   /* ---------------------------------------------------------------- Hero extras */
 
-  const bubbleGeometry = new THREE.IcosahedronGeometry(1, 2);
+  const additive = (color, opacity) => ({ color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false });
+  /** A colour pushed past white, so the bloom pass makes it glow. */
+  const hot = (hex, boost = 1.6) => new THREE.Color(hex).multiplyScalar(boost);
+  const shellGeometry = new THREE.IcosahedronGeometry(1, 3);
+  const latticeGeometry = new THREE.WireframeGeometry(new THREE.IcosahedronGeometry(1.03, 1));
+  const hoopGeometry = new THREE.TorusGeometry(1.15, 0.024, 6, 56);
+  const auraGeometry = new THREE.IcosahedronGeometry(1, 2);
+
   for (const side of SIDES) {
-    const aura = (color, radius, opacity) => {
-      const mesh = new THREE.Mesh(
-        bubbleGeometry,
-        new THREE.MeshBasicMaterial({ color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
-      );
-      mesh.position.y = 1.35;
-      mesh.scale.setScalar(radius);
-      mesh.visible = false;
-      heroes[side].group.add(mesh);
-      return mesh;
+    const hero = heroes[side];
+    const spell = colors.spell[side];
+    const sprite = (hex, size) => {
+      const node = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture, ...additive(hot(hex), 1) }));
+      node.scale.setScalar(size);
+      return node;
     };
-    heroes[side].shield = aura(0x6ab8ff, 1.75, 0.24);
-    heroes[side].power = aura(0xffc94a, 1.45, 0.2);
+
+    // Aegis Shield: a sphere of energy, a lattice turning inside it and two hoops orbiting it.
+    const shell = new THREE.Mesh(shellGeometry, new THREE.MeshBasicMaterial({ ...additive(hot(spell.shield, 1.1), 0.2), side: THREE.DoubleSide }));
+    const lattice = new THREE.LineSegments(latticeGeometry, new THREE.LineBasicMaterial(additive(hot(spell.shield, 2.2), 0.8)));
+    const hoops = [0, 1].map(() => {
+      const hoop = new THREE.Mesh(hoopGeometry, new THREE.MeshBasicMaterial(additive(hot(0xfff3c4, 2.2), 0.9)));
+      hoop.rotation.order = 'YXZ';
+      return hoop;
+    });
+    const shield = new THREE.Group();
+    shield.position.y = 1.4;
+    shield.add(shell, lattice, ...hoops);
+
+    // Double Damage: a flickering shell of amber fire.
+    const power = new THREE.Mesh(auraGeometry, new THREE.MeshBasicMaterial({ ...additive(hot(colors.rune.damage, 1.4), 0.22), side: THREE.DoubleSide }));
+    power.position.y = 1.35;
+
+    // Lifesteal Blade: crimson wisps circling the hero. Stun: sparks circling its head.
+    const wisps = [0, 1, 2].map(() => sprite(colors.lifesteal, 0.5));
+    const stars = [0, 1, 2].map(() => sprite(0xfff2a0, 0.42));
+
+    for (const node of [shield, power, ...wisps, ...stars]) {
+      node.visible = false;
+      hero.group.add(node);
+    }
+    Object.assign(hero, { shield, shell, lattice, hoops, power, wisps, stars });
   }
 
   /* ---------------------------------------------------------------- Views */
@@ -354,6 +404,11 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
       spawn: 0,
       flash: 0,
       moving: 0,
+      /** Stride phase, advanced by the ground covered. */
+      gait: 0,
+      /** Seconds since the Aegis Shield went up, and since the last buff particles were shed. */
+      shieldAge: 0,
+      shed: 0,
       life: 1,
       phase: (id * 2.399) % TAU,
       stamp: 0,
@@ -382,11 +437,16 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
         Object.assign(view, { fromX: view.x, fromZ: view.z, toX: x, toZ: z, t: 0 });
       }
       if (hp < view.hp) view.flash = 1;
-      const wasDead = view.flags & FLAG.dead;
+      const before = view.flags;
       view.hp = hp;
       view.flags = flags;
       view.stamp = stamp;
-      if (view.type === 'hero' && Boolean(wasDead) !== Boolean(flags & FLAG.dead)) heroChanged(view);
+      if (view.type === 'hero') {
+        if ((before ^ flags) & FLAG.dead) heroChanged(view);
+        if (flags & FLAG.shielded & ~before) view.shieldAge = 0;
+        // The shield ran out or was beaten down.
+        if (before & FLAG.shielded & ~flags && !(flags & FLAG.dead)) fx.shieldBreak(view.side, view.x, view.y + 1.4, view.z);
+      }
       if (atk !== view.atk) {
         view.atk = atk;
         view.targetId = targetId;
@@ -420,7 +480,11 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
       const reach = Math.min(gap, def.radius + 1.1);
       fx.slam(view.x + ((target.x - view.x) / gap) * reach, view.z + ((target.z - view.z) / gap) * reach, view.palette.glow[0], SWING_S * 0.5);
     } else if (view.type === 'hero') {
-      fx.sparks(target.x, target.y, target.z, view.palette.glow[1], 6, 2.6, 0.3, 0.22);
+      // A sword cut: a crescent of light in front of the hero, sparks where it bites.
+      const heading = Math.atan2(target.x - view.x, target.z - view.z);
+      fx.heroSlash(view.side, view.x + Math.sin(heading) * 0.75, view.y + 1.45, view.z + Math.cos(heading) * 0.75, heading);
+      fx.sparks(target.x, target.y, target.z, colors.spell[view.side].slash, 7, 3, 0.32, 0.24);
+      if (view.flags & FLAG.lifesteal) fx.drain(target, { x: view.x, y: view.y + 1.3, z: view.z });
     } else {
       // Dozens of troops swing every second, so their hits are a single cheap flash.
       fx.flash(target.x, target.y, target.z, 0xfff2c8, 1.1, 0.18);
@@ -475,6 +539,7 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
     view.z = z;
     view.y = groundHeight(x, z);
     view.moving += ((walking ? 1 : 0) - view.moving) * Math.min(1, dt * 10);
+    view.gait += Math.hypot(vx, vz) * dt * 2.5;
 
     // Face the target while fighting, otherwise the way it is walking.
     const target = view.swing > 0 || !walking ? point(view.targetId) : null;
@@ -525,7 +590,7 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
     }
 
     const ground = view.y + 0.04;
-    addDecal(view.x, ground, view.z, def.radius * 1.7, 0, 0.42 * view.life, 0x000000);
+    addDecal(view.x, ground, view.z, def.radius * 1.6, 0, 0.3 * view.life, 0x000000);
     addDecal(view.x, ground + 0.01, view.z, Math.max(def.radius * 1.35, 0.3 * view.scale + 0.25), 1, 0.9 * view.life, palette.team);
     if (def.building && view.life === 1) addDecal(view.x, ground, view.z, def.range, 2, 0.5, 0x9fe9ff);
     if (view.life === 1) {
@@ -534,9 +599,10 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
     }
   }
 
-  function drawHero(view, time) {
+  function drawHero(view, time, dt) {
     const hero = heroes[view.side];
-    const dead = Boolean(view.flags & FLAG.dead);
+    const { flags } = view;
+    const dead = Boolean(flags & FLAG.dead);
     hero.group.visible = !dead;
     if (dead) return;
     const [lunge, lean, bob] = pose(view, time);
@@ -544,12 +610,78 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
     hero.body.position.set(Math.sin(view.facing) * lunge, 0.05 + bob, Math.cos(view.facing) * lunge);
     hero.body.rotation.set(lean, view.facing, 0, 'YXZ');
     hero.ring.rotation.y = time * 0.9;
-    hero.shield.visible = Boolean(view.flags & FLAG.shielded);
-    hero.shield.rotation.y = time * 0.8;
-    hero.power.visible = Boolean(view.flags & FLAG.empowered);
-    hero.power.scale.setScalar(1.45 + Math.sin(time * 8) * 0.08);
     // Lit from within for a moment when struck.
-    hero.body.scale.setScalar(1.3 * (1 + view.flash * 0.06));
+    hero.body.scale.setScalar(hero.size * (1 + view.flash * 0.06));
+
+    // Stride: the legs scissor and the shield arm swings against them, in step with the ground covered.
+    const stride = Math.sin(view.gait) * 0.8 * view.moving;
+    hero.legs[0].rotation.x = stride;
+    hero.legs[1].rotation.x = -stride;
+    hero.shieldArm.rotation.x = -stride * 0.5 - view.moving * 0.15;
+    // Sword arm: wind up over the shoulder, cut down in front, recover. The blade turns at the wrist to extend the arm.
+    const t = view.swing > 0 ? 1 - view.swing : 1;
+    let arm = stride * 0.5;
+    let wrist = 0;
+    if (t < 0.22) {
+      arm = -3.4 * (t / 0.22);
+      wrist = 3 * (t / 0.22);
+    } else if (t < 0.55) {
+      arm = -3.4 + 2.5 * (1 - (1 - (t - 0.22) / 0.33) ** 3);
+      wrist = 3;
+    } else if (t < 1) {
+      const settle = (t - 0.55) / 0.45;
+      arm = -0.9 * (1 - settle) + stride * 0.5 * settle;
+      wrist = 3 * (1 - settle);
+    }
+    hero.swordArm.rotation.x = arm;
+    hero.blade.rotation.x = wrist;
+
+    // Aegis Shield: pops open, then turns for as long as it holds; it flares when it soaks a blow.
+    const shielded = Boolean(flags & FLAG.shielded);
+    hero.shield.visible = shielded;
+    if (shielded) {
+      view.shieldAge += dt;
+      const open = Math.min(1, view.shieldAge / 0.28);
+      const overshoot = 1 + 2.2 * (open - 1) ** 3 + 1.2 * (open - 1) ** 2;
+      hero.shield.scale.setScalar(1.8 * (0.35 + 0.65 * overshoot));
+      hero.lattice.rotation.set(time * 0.7, time * 1.4, 0);
+      hero.shell.rotation.y = -time * 0.5;
+      hero.shell.material.opacity = 0.17 + 0.05 * Math.sin(time * 5) + 0.3 * view.flash;
+      hero.hoops[0].rotation.set(1.05, time * 2.2, 0);
+      hero.hoops[1].rotation.set(-1.05, -time * 1.7, 0);
+    }
+
+    const empowered = Boolean(flags & FLAG.empowered);
+    hero.power.visible = empowered;
+    if (empowered) {
+      hero.power.scale.setScalar(1.5 + Math.sin(time * 9) * 0.1);
+      hero.power.rotation.y = time * 2;
+    }
+
+    const stunned = Boolean(flags & FLAG.stunned);
+    const vampiric = Boolean(flags & FLAG.lifesteal);
+    for (let i = 0; i < 3; i++) {
+      const angle = (i / 3) * TAU;
+      hero.stars[i].visible = stunned;
+      hero.stars[i].position.set(Math.cos(time * 6 + angle) * 0.55, 3.1, Math.sin(time * 6 + angle) * 0.55);
+      hero.wisps[i].visible = vampiric;
+      hero.wisps[i].position.set(Math.cos(time * 2.4 + angle) * 1.05, 0.9 + 0.5 * Math.sin(time * 3 + angle * 2), Math.sin(time * 2.4 + angle) * 1.05);
+    }
+
+    // Auras on the ground, and what the running buffs shed into the air.
+    const ground = view.y + 0.05;
+    if (vampiric) addDecal(view.x, ground, view.z, 1.5, 1, 0.75, colors.lifesteal);
+    if (empowered) addDecal(view.x, ground, view.z, 1.85, 1, 0.8, colors.rune.damage);
+    if (flags & FLAG.hasted) addDecal(view.x, ground, view.z, 1.85, 1, 0.8, colors.rune.haste);
+    if (flags & FLAG.regen) addDecal(view.x, ground, view.z, 1.85, 1, 0.8, colors.rune.regen);
+    view.shed += dt;
+    if (view.shed > 0.09) {
+      view.shed = 0;
+      // Haste leaves a streak of light behind a running hero; Arcane Regen lifts motes around it.
+      if (flags & FLAG.hasted && view.moving > 0.5) fx.flash(view.x, view.y + 0.9, view.z, colors.rune.haste, 2.4, 0.4);
+      if (flags & FLAG.regen) fx.rise(view.x, view.z, 0.9, colors.rune.regen, 2, 0.8, 1.2);
+      if (empowered) fx.rise(view.x, view.z, 0.7, colors.rune.damage, 1, 0.6, 1.6);
+    }
   }
 
   function update(dt, time) {
@@ -559,7 +691,7 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
 
     for (const view of views.values()) {
       advance(view, dt);
-      if (view.type === 'hero') drawHero(view, time);
+      if (view.type === 'hero') drawHero(view, time, dt);
       else draw(view, time);
     }
     for (let i = dying.length - 1; i >= 0; i--) {
@@ -594,14 +726,20 @@ export function createUnitLayer({ scene, Batch, pen, lean, solidMaterial, glowMa
       return view ? { x: view.x, y: view.y, z: view.z, facing: view.facing, dead: Boolean(view.flags & FLAG.dead) } : null;
     },
 
-    /** Id of the enemy of `side` under a ground point, or 0. */
+    /**
+     * Id of the enemy of `side` under a ground point, or 0. A click lands on a
+     * unit's body, which the tilted camera shows stretched up-screen from its
+     * feet, so the whole of that stretch counts.
+     */
     pick(x, z, side) {
       let best = 0;
       let bestGap = Infinity;
       for (const view of views.values()) {
         if (view.side === side || view.flags & FLAG.dead) continue;
-        const gap = Math.hypot(view.x - x, view.z - z) - view.def.radius;
-        if (gap < 0.55 && gap < bestGap) {
+        const reach = (view.def.height * 0.85) / tanPitch;
+        const nearest = Math.min(view.z, Math.max(view.z - reach, z));
+        const gap = Math.hypot(view.x - x, nearest - z) - view.def.radius;
+        if (gap < 0.5 && gap < bestGap) {
           best = view.id;
           bestGap = gap;
         }

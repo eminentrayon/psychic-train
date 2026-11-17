@@ -22,7 +22,7 @@ import express from 'express';
 import { Server } from 'socket.io';
 
 import { createGame } from './game.js';
-import { DECK, HERO, SIDES } from './public/shared.js';
+import { DECK, HERO, HEROES, SIDES } from './public/shared.js';
 
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                              */
@@ -31,14 +31,17 @@ import { DECK, HERO, SIDES } from './public/shared.js';
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const THREE_DIR = path.join(ROOT_DIR, 'node_modules', 'three', 'build');
+/** Post-processing passes (bloom) ship with Three.js as separate modules. */
+const THREE_ADDONS_DIR = path.join(ROOT_DIR, 'node_modules', 'three', 'examples', 'jsm');
 const PORT = envInt('PORT', 3000);
 const QUEUE_TIMEOUT_MS = envInt('QUEUE_TIMEOUT_MS', 60_000);
 const MATCH_COUNTDOWN_MS = envInt('MATCH_COUNTDOWN_MS', 5_000);
 const NICKNAME_MAX_LENGTH = 16;
 
+/** The warlords who command Morgath when no human rival appears. */
 const BOT_NAMES = [
   'Vexis the Hollow',
-  'Morgath',
+  'Dread Regent',
   'Ashen Oracle',
   'Kael the Unbound',
   'Obsidian Warden',
@@ -59,10 +62,11 @@ app.get('/healthz', (_req, res) => {
 
 app.get('/api/config', (_req, res) => {
   res.set('Cache-Control', 'no-store');
-  res.json({ hero: HERO, deck: DECK, queueTimeoutMs: QUEUE_TIMEOUT_MS });
+  res.json({ hero: HERO, heroes: HEROES, deck: DECK, queueTimeoutMs: QUEUE_TIMEOUT_MS });
 });
 
 // The browser imports Three.js as an ES module through the import map in index.html.
+app.use('/vendor/three/addons', express.static(THREE_ADDONS_DIR, { maxAge: '7d' }));
 app.use('/vendor/three', express.static(THREE_DIR, { maxAge: '7d' }));
 app.use(express.static(PUBLIC_DIR, { extensions: ['html'] }));
 

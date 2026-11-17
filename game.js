@@ -7,7 +7,7 @@
  *
  * Sent to each player
  *   game:state    snapshot ten times a second: structures, units, and the player's private state
- *   game:events   [{ type: 'card' | 'cast' | 'item' | 'rune' | 'runeTaken' | 'heroDown' | 'reject', ... }]
+ *   game:events   [{ type: 'card' | 'cast' | 'item' | 'rune' | 'runeTaken' | 'bounty' | 'heroDown' | 'reject', ... }]
  *   game:over     { winner, reason, totals }
  *
  * Attacks are not events. Every unit and structure carries an attack counter and
@@ -23,6 +23,8 @@ import {
   LANES,
   MAP,
   MATCH,
+  RUNES,
+  RUNE_KINDS,
   SIDES,
   STRUCTURES,
   UNITS,
@@ -39,7 +41,8 @@ const ABILITIES = new Map(HERO.abilities.map((ability) => [ability.key, ability]
 const ITEMS = new Map(HERO.items.map((item) => [item.key, item]));
 const TYPE_INDEX = new Map(UNIT_TYPES.map((type, index) => [type, index]));
 const LIFESTEAL = HERO.items.find((item) => item.lifesteal).lifesteal;
-const RUNE = HERO.items.find((item) => item.holdsRune);
+/** The hero field that holds each rune effect's end time. */
+const RUNE_TIMER = { damage: 'empowerUntil', haste: 'hasteUntil', regen: 'regenUntil' };
 const RUNE_PICKUP_RADIUS = 1.8;
 /** Where a hero steps on and off a bridge, and onto the rune pad's stepping stones. */
 const BRIDGE_END_X = 3.7;
@@ -131,7 +134,8 @@ export function createGame({ players, emit, onOver }) {
   let elapsedMs = 0;
   let nextWaveMs = MATCH.waveFirstMs;
   let nextRuneMs = MATCH.runeFirstSpawnMs;
-  let runeActive = false;
+  /** Kind of the rune waiting on the River pad, or null. */
+  let padRune = null;
   let over = false;
   let lastTick = performance.now();
   let sinceSnapshot = 0;
@@ -143,7 +147,7 @@ export function createGame({ players, emit, onOver }) {
       team: teams[side],
       units,
       structures,
-      runeActive: () => runeActive,
+      rune: () => ({ kind: padRune, nextInMs: nextRuneMs - elapsedMs }),
       intents: { playCard, cast, useItem, heroMove, heroAttack },
     }),
   );
@@ -165,8 +169,13 @@ export function createGame({ players, emit, onOver }) {
       respawnAt: 0,
       shield: 0,
       shieldUntil: 0,
-      rune: false,
+      /** Kind of the rune in the bottle, or null. */
+      rune: null,
+      /** Relics bought so far, by key. */
+      owned: {},
       empowerUntil: 0,
+      hasteUntil: 0,
+      regenUntil: 0,
     });
     return { side, elixir: MATCH.elixirStart, hand: deck.slice(0, MATCH.handSize), queue: deck.slice(MATCH.handSize), hero };
   }
@@ -260,7 +269,10 @@ export function createGame({ players, emit, onOver }) {
       (unit.stunUntil > elapsedMs ? FLAG.stunned : 0) |
       (unit.shieldUntil > elapsedMs && unit.shield > 0 ? FLAG.shielded : 0) |
       (unit.dead ? FLAG.dead : 0) |
-      (unit.empowerUntil > elapsedMs ? FLAG.empowered : 0)
+      (unit.empowerUntil > elapsedMs ? FLAG.empowered : 0) |
+      (unit.hasteUntil > elapsedMs ? FLAG.hasted : 0) |
+      (unit.regenUntil > elapsedMs ? FLAG.regen : 0) |
+      (unit.owned?.X ? FLAG.lifesteal : 0)
     );
   }
 
@@ -268,7 +280,7 @@ export function createGame({ players, emit, onOver }) {
   function worldState() {
     return {
       timeLeftMs: Math.max(0, MATCH.durationMs - elapsedMs),
-      rune: { active: runeActive, nextInMs: Math.max(0, nextRuneMs - elapsedMs) },
+      rune: { kind: padRune, nextInMs: Math.max(0, nextRuneMs - elapsedMs) },
       structures: structures.map((s) => [Math.ceil(s.hp), s.atk, s.atkTarget]),
       units: units.map((u) => [
         u.id,
@@ -291,6 +303,12 @@ export function createGame({ players, emit, onOver }) {
     for (const key of [...ABILITIES.keys(), ...ITEMS.keys()]) {
       cooldowns[key] = Math.max(0, (hero.readyAt[key] ?? 0) - elapsedMs);
     }
+    // Rune effects still running, as { kind: ms left }.
+    const buffs = {};
+    for (const kind of RUNE_KINDS) {
+      const left = hero[RUNE_TIMER[kind]] - elapsedMs;
+      if (left > 0) buffs[kind] = Math.round(left);
+    }
     return {
       elixir: team.elixir,
       hand: team.hand,
@@ -302,6 +320,8 @@ export function createGame({ players, emit, onOver }) {
         level: hero.level,
         gold: Math.floor(hero.gold),
         rune: hero.rune,
+        owned: hero.owned,
+        buffs,
         respawnMs: hero.dead ? Math.max(0, hero.respawnAt - elapsedMs) : 0,
       },
       cooldowns,
@@ -334,7 +354,8 @@ export function createGame({ players, emit, onOver }) {
     const before = Math.hypot(x - unit.x, z - unit.z);
     if (before < 0.01) return;
     const slowed = unit.slowUntil > elapsedMs ? 1 - UNITS.frost_tower.slow : 1;
-    const step = Math.min(before, (unit.def.speed * slowed * dt) / 1000);
+    const hasted = unit.hasteUntil > elapsedMs ? RUNES.haste.speedMultiplier : 1;
+    const step = Math.min(before, (unit.def.speed * slowed * hasted * dt) / 1000);
     tryMove(unit, ((x - unit.x) / before) * step, ((z - unit.z) / before) * step);
     const gained = before - Math.hypot(x - unit.x, z - unit.z);
     unit.blockedMs = gained > step * 0.3 ? 0 : unit.blockedMs + dt;
@@ -397,7 +418,12 @@ export function createGame({ players, emit, onOver }) {
 
   /* ---------------------------------------------------------------- Combat */
 
-  const powerOf = (unit) => (unit.empowerUntil > elapsedMs ? RUNE.damageMultiplier : 1);
+  const powerOf = (unit) => (unit.empowerUntil > elapsedMs ? RUNES.damage.damageMultiplier : 1);
+
+  /** The Lifesteal Blade returns a share of the damage its owner deals. */
+  function drain(hero, dealt) {
+    if (hero.owned.X && dealt > 0 && alive(hero)) hero.hp = Math.min(hero.maxHp, hero.hp + dealt * LIFESTEAL);
+  }
 
   /** The closest enemy this unit is allowed to fight and can see. */
   function acquire(unit) {
@@ -429,9 +455,9 @@ export function createGame({ players, emit, onOver }) {
       projectiles.push({ x: unit.x, z: unit.z, tx: target.x, tz: target.z, target, speed: def.shotSpeed, damage, source: unit });
       return;
     }
-    hurt(target, damage, unit);
+    const dealt = hurt(target, damage, unit);
     if (def.slowMs && !target.isStructure) target.slowUntil = elapsedMs + def.slowMs;
-    if (unit.isHero) unit.hp = Math.min(unit.maxHp, unit.hp + damage * LIFESTEAL);
+    if (unit.isHero) drain(unit, dealt);
   }
 
   /** Attacks `target` if it is in reach, otherwise closes the distance. */
@@ -540,17 +566,25 @@ export function createGame({ players, emit, onOver }) {
     }
   }
 
+  /** Applies damage and returns how much health it actually removed. */
   function hurt(target, amount, source) {
-    if (over || !alive(target)) return;
+    if (over || !alive(target)) return 0;
     if (target.shieldUntil > elapsedMs && target.shield > 0) {
       const absorbed = Math.min(target.shield, amount);
       target.shield -= absorbed;
       amount -= absorbed;
     }
-    target.hp = Math.max(0, target.hp - amount);
-    if (target.hp > 0) return;
+    const dealt = Math.min(target.hp, amount);
+    target.hp -= dealt;
+    if (target.hp > 0) return dealt;
 
-    teams[source ? source.side : opposite(target.side)].hero.gold += target.def.bounty;
+    // Troops pay only the hero who lands the killing blow; Towers and heroes pay whoever fells them.
+    const { bounty } = target.def;
+    if (bounty && (target.isStructure || target.isHero || source?.isHero)) {
+      const earner = source ? source.side : opposite(target.side);
+      teams[earner].hero.gold += bounty;
+      outbox[earner].push({ type: 'bounty', gold: bounty, id: target.id, x: round(target.x), z: round(target.z) });
+    }
     if (target.isStructure) {
       if (target.def.kind === 'throne') finish('throne', opposite(target.side));
     } else if (target.isHero) {
@@ -560,18 +594,24 @@ export function createGame({ players, emit, onOver }) {
       target.target = null;
       broadcast({ type: 'heroDown', side: target.side, respawnMs: MATCH.heroRespawnMs });
     }
+    return dealt;
   }
 
-  /** Damages every enemy of `side` that `hits` accepts. Structures take a reduced share and are never stunned. */
+  /**
+   * Damages every enemy of `side` that `hits` accepts and returns the total dealt.
+   * Structures take a reduced share and are never stunned.
+   */
   function blast(side, source, damage, hits, stunMs = 0) {
+    let dealt = 0;
     for (const unit of units) {
       if (unit.side === side || !alive(unit) || !hits(unit)) continue;
-      hurt(unit, damage, source);
+      dealt += hurt(unit, damage, source);
       if (stunMs && !unit.building) unit.stunUntil = elapsedMs + stunMs;
     }
     for (const s of structures) {
-      if (s.side !== side && alive(s) && hits(s)) hurt(s, damage * ABILITY_STRUCTURE_FACTOR, source);
+      if (s.side !== side && alive(s) && hits(s)) dealt += hurt(s, damage * ABILITY_STRUCTURE_FACTOR, source);
     }
+    return dealt;
   }
 
   /** Removes the fallen and any Frost Tower whose time is up. Heroes stay and respawn. */
@@ -605,10 +645,15 @@ export function createGame({ players, emit, onOver }) {
       const resting = distance(hero, home) < home.radius + HERO.fountainRadius;
       hero.hp = Math.min(hero.maxHp, hero.hp + ((resting ? HERO.fountainHp : HERO.hpRegen) * dt) / 1000);
       hero.mana = Math.min(HERO.maxMana, hero.mana + ((resting ? HERO.fountainMana : HERO.manaRegen) * dt) / 1000);
-      if (runeActive && Math.hypot(hero.x, hero.z) < RUNE_PICKUP_RADIUS) {
-        runeActive = false;
-        hero.rune = true;
-        broadcast({ type: 'runeTaken', side });
+      if (hero.regenUntil > elapsedMs) {
+        hero.hp = Math.min(hero.maxHp, hero.hp + (RUNES.regen.hpPerSecond * dt) / 1000);
+        hero.mana = Math.min(HERO.maxMana, hero.mana + (RUNES.regen.manaPerSecond * dt) / 1000);
+      }
+      // Walking over the pad bottles its rune, replacing whatever the bottle held.
+      if (padRune && Math.hypot(hero.x, hero.z) < RUNE_PICKUP_RADIUS) {
+        hero.rune = padRune;
+        broadcast({ type: 'runeTaken', side, kind: padRune });
+        padRune = null;
       }
     }
 
@@ -619,8 +664,8 @@ export function createGame({ players, emit, onOver }) {
     // An unclaimed rune is simply replaced by the next one.
     if (elapsedMs >= nextRuneMs) {
       nextRuneMs += MATCH.runeIntervalMs;
-      runeActive = true;
-      broadcast({ type: 'rune' });
+      padRune = RUNE_KINDS[Math.floor(Math.random() * RUNE_KINDS.length)];
+      broadcast({ type: 'rune', kind: padRune });
     }
     while (!over && pending.length && pending[0].at <= elapsedMs) pending.shift().run();
 
@@ -786,16 +831,23 @@ export function createGame({ players, emit, onOver }) {
     if (key === 'Q') {
       const from = { x: hero.x, z: hero.z };
       travel(hero, aimPoint(hero, x, z, ability.range), false);
-      blast(side, hero, damage, (target) => segmentDistance(target, from, hero) <= ability.width / 2 + target.radius);
+      drain(hero, blast(side, hero, damage, (target) => segmentDistance(target, from, hero) <= ability.width / 2 + target.radius));
       Object.assign(event, { tx: round(hero.x), tz: round(hero.z) });
     } else if (key === 'W') {
       hero.shield = ability.shield;
       hero.shieldUntil = elapsedMs + ability.durationMs;
     } else {
       const aim = aimPoint(hero, x, z, ability.range);
-      const strikeArea = () => blast(side, hero, damage, (target) => distance(target, aim) <= ability.radius + target.radius, ability.stunMs);
-      if (ability.delayMs) schedule(ability.delayMs, strikeArea);
-      else strikeArea();
+      const inArea = (target) => distance(target, aim) <= ability.radius + target.radius;
+      if (ability.durationMs) {
+        // The pillar burns for its whole duration: the damage is split over evenly spaced ticks.
+        const ticks = Math.round(ability.durationMs / ability.tickMs);
+        for (let i = 0; i < ticks; i++) {
+          schedule(ability.delayMs + i * ability.tickMs, () => drain(hero, blast(side, hero, damage / ticks, inArea)));
+        }
+      } else {
+        drain(hero, blast(side, hero, damage, inArea, ability.stunMs));
+      }
       Object.assign(event, { tx: round(aim.x), tz: round(aim.z) });
     }
     broadcast(event);
@@ -805,15 +857,25 @@ export function createGame({ players, emit, onOver }) {
   function useItem(side, key, x, z) {
     const item = ITEMS.get(key);
     if (over || !item) return;
-    if (item.passive) return reject(side, `${item.name} is passive`);
-    const hero = actingHero(side);
-    if (!hero) return;
+    const { hero } = teams[side];
+    // The first press of a relic's key buys it. A hero may shop while respawning.
+    if (item.cost && !hero.owned[key]) {
+      if (hero.gold < item.cost) return reject(side, `${item.name} costs ${item.cost} gold`);
+      hero.gold -= item.cost;
+      hero.owned[key] = true;
+      broadcast({ type: 'item', side, key, bought: true, x: round(hero.x), z: round(hero.z) });
+      emit(side, 'game:state', snapshot(side));
+      return;
+    }
+    if (item.passive) return reject(side, `${item.name} is always active`);
+    if (!actingHero(side)) return;
     const event = { type: 'item', side, key, x: round(hero.x), z: round(hero.z) };
 
     if (item.holdsRune) {
-      if (!hero.rune) return reject(side, 'No Power Rune stored');
-      hero.rune = false;
-      hero.empowerUntil = elapsedMs + item.durationMs;
+      if (!hero.rune) return reject(side, 'The Rune Bottle is empty');
+      event.rune = hero.rune;
+      hero[RUNE_TIMER[hero.rune]] = elapsedMs + RUNES[hero.rune].durationMs;
+      hero.rune = null;
     } else {
       if ((hero.readyAt[key] ?? 0) > elapsedMs) return reject(side, `${item.name} is on cooldown`);
       hero.readyAt[key] = elapsedMs + item.cooldownMs;
