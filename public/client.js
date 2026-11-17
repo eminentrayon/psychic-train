@@ -3,7 +3,7 @@
    Animated backdrop, loadout bar (nickname / hero / deck) and matchmaking.
    ========================================================================== */
 
-import { CARD_ICONS, HERO_PORTRAIT, SIGILS } from './art.js';
+import { cardArt, portraitArt } from './paint.js';
 
 const NICK_STORAGE_KEY = 'runedeck.nickname';
 const NICK_MAX_LENGTH = 16;
@@ -819,8 +819,18 @@ function initNickname() {
   });
 }
 
-function renderHero(hero) {
-  dom.heroPortrait.innerHTML = HERO_PORTRAIT;
+/** A painted illustration as an <img>. */
+function painting(src) {
+  const node = el('img');
+  node.src = src;
+  node.alt = '';
+  node.draggable = false;
+  return node;
+}
+
+/** `heroes` names each side's champion: the selected hero leads the Radiant, his rival the Dire. */
+function renderHero(hero, heroes) {
+  dom.heroPortrait.replaceChildren(painting(portraitArt(hero.id)));
   dom.heroName.textContent = hero.name;
   dom.heroRole.textContent = hero.role;
   const abilityKeys = hero.abilities.map((ability) => ability.key);
@@ -832,10 +842,10 @@ function renderHero(hero) {
       typeClass: 'type-hero',
       typeLine: `Hero · ${hero.role}`,
       description: hero.description,
-      traits: ['Mouse Move & Attack', `Abilities ${abilityKeys.join(' ')}`],
+      traits: ['Mouse Move & Attack', `Abilities ${abilityKeys.join(' ')}`, `Relics ${hero.items.map((item) => item.key).join(' ')}`],
     }),
   );
-  for (const node of document.querySelectorAll('.side-hero')) node.textContent = hero.name;
+  for (const side of ['radiant', 'dire']) $(`hero-${side}`).textContent = `${heroes[side].name} · ${heroes[side].title}`;
 }
 
 function renderDeck(deck) {
@@ -849,7 +859,7 @@ function renderDeck(deck) {
       const cost = el('span', 'card-cost');
       cost.append(el('span', '', String(card.cost)));
       const art = el('span', 'card-art');
-      art.innerHTML = CARD_ICONS[card.id] ?? CARD_ICONS.unknown;
+      art.append(painting(cardArt(card.id)));
       item.append(cost, art, el('span', 'card-name', card.name));
 
       bindTooltip(item, () =>
@@ -882,9 +892,9 @@ async function loadConfig(attempt = 0) {
     return;
   }
 
-  const { hero, deck, queueTimeoutMs } = state.config;
+  const { hero, heroes, deck, queueTimeoutMs } = state.config;
   state.queue.timeoutMs = queueTimeoutMs;
-  renderHero(hero);
+  renderHero(hero, heroes);
   renderDeck(deck);
 
   const limit = formatClock(queueTimeoutMs);
@@ -1006,7 +1016,7 @@ function showMatch(receivedAt) {
     $(`name-${side}`).textContent = info.nickname;
     $(`tag-${side}`).textContent = isYou ? 'You' : info.isBot ? 'AI Bot' : 'Opponent';
     $(`side-${side}`).classList.toggle('is-you', isYou);
-    $(`sigil-${side}`).innerHTML = SIGILS[side];
+    $(`sigil-${side}`).replaceChildren(painting(portraitArt(state.config.heroes[side].id)));
   }
   dom.matchMode.textContent = match.vsBot ? '1v1 · Versus AI Bot' : '1v1 · Player versus Player';
   dom.matchNote.textContent = `You fight for the ${match.side === 'radiant' ? 'Radiant, on the left' : 'Dire, on the right'}.`;
@@ -1049,7 +1059,7 @@ function loadGameView() {
     .then(({ createMatchView }) => {
       gameView = createMatchView({ socket, onExit: leaveMatch });
       // Console diagnostics: runedeck.stats() reports FPS, draw calls and triangles.
-      window.runedeck = { stats: gameView.stats };
+      window.runedeck = { stats: gameView.stats, project: gameView.project, lockQuality: gameView.lockQuality, fx: gameView.fx, heroView: gameView.heroView };
       return gameView;
     })
     .catch((error) => {

@@ -1,23 +1,31 @@
 /**
  * RuneDeck — battlefield renderer (Three.js).
  *
- * A fixed orthographic camera looks down the Z axis so the whole arena fits one
- * screen: Radiant on the left, Dire on the right, the River between them.
+ * A fixed perspective camera, pitched 47 degrees like a MOBA's, looks down the
+ * Z axis so the whole arena fits one screen: Radiant on the left, Dire on the
+ * right, the River between them. The frame is rendered in HDR and bloomed, so
+ * lava, crystals and spell effects glow; every unit casts a real shadow.
  *
  * Built for a steady 60 FPS:
  *  - the terrain is painted by a procedural shader that is baked to a texture
  *    once; per frame only the water and the emissive glow are animated;
  *  - static props are merged into two meshes (lit and glowing);
- *  - shadows are rendered once and reused, because nothing that casts one moves.
+ *  - render resolution steps down, and bloom switches off, on a GPU that cannot keep up.
  */
 
 import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
-import { MAP, STRUCTURES, heroSpawn, riverCenter, riverDistance } from './shared.js';
-import { createUnitLayer } from './units.js';
+import { MAP, STRUCTURES, groundHeight, heroSpawn, riverCenter, riverDistance } from './shared.js';
+import { GLSL_TO_LINEAR, createUnitLayer } from './units.js';
 
 const TAU = Math.PI * 2;
-const PITCH = THREE.MathUtils.degToRad(50);
+const PITCH = THREE.MathUtils.degToRad(47);
+/** Vertical field of view. Narrow enough that the far bank stays readable, wide enough to give the arena depth. */
+const FOV = 30;
 const SIN_P = Math.sin(PITCH);
 const COS_P = Math.cos(PITCH);
 /** Terrain plane, larger than the playable field so its edge can fade into the void. */
@@ -26,7 +34,19 @@ const GROUND_D = 36;
 const VOID_COLOR = 0x05070f;
 const LIGHT_DIR = new THREE.Vector3(-0.42, 0.78, 0.46).normalize();
 const TEAM_COLOR = { radiant: 0x4fc3ff, dire: 0xff5a36 };
-const RUNE_COLOR = 0xffc94a;
+const RUNE_COLOR = { damage: 0xffa41a, haste: 0x5dffb0, regen: 0xb48cff };
+const GOLD = 0xffd766;
+const LIFESTEAL_COLOR = 0xff2a4a;
+/**
+ * Ability colours by side. The Aether Knight's are the classic gold and cyan;
+ * Morgath casts the same spells in ember and violet, so a glance tells whose they are.
+ */
+const SPELL = {
+  radiant: { slash: 0xffd766, shield: 0xffcf5a, bolt: 0x5ff0ff, boltCore: 0xeaffff, pillar: 0xffd766, pillarCore: 0xfff3c4, blink: 0x4aa8ff, blinkCore: 0xd6ebff },
+  dire: { slash: 0xff8a3a, shield: 0xff7a2e, bolt: 0xc77dff, boltCore: 0xf3e2ff, pillar: 0xff5a2a, pillarCore: 0xffd2a0, blink: 0xb04aff, blinkCore: 0xecd6ff },
+};
+/** How far glowing materials are pushed past white, so the bloom pass picks them up. */
+const GLOW_BOOST = 1.3;
 
 /** Lanes and plazas for one quadrant; the layout is mirrored on both axes. */
 const PATH = { bendX: 14, gateX: 16.5, gateZ: 3.5, lane: 1.15, link: 1.05, throne: 5, tower: 2.7, heroPad: 1.5 };
@@ -298,6 +318,7 @@ uniform vec3 uVoid;
 varying vec2 vPos;
 ${GLSL_NOISE}
 ${GLSL_FIELD}
+${GLSL_TO_LINEAR}
 
 float flow(vec2 p) {
   float amp = 0.5;
@@ -350,13 +371,22 @@ void main() {
   float pulse = 0.72 + 0.28 * sin(uTime * 1.7 + p.x * 0.9 + p.y * 1.3);
   vec3 lava = mix(vec3(0.95, 0.14, 0.02), vec3(1.0, 0.80, 0.28), smoothstep(0.3, 0.95, base.a)) * pulse * 1.3;
   vec3 arcane = vec3(0.30, 0.82, 1.0) * (0.8 + 0.2 * sin(uTime * 1.2 + p.x));
-  col += mix(arcane, lava, dire) * base.a;
+  vec3 emissive = mix(arcane, lava, dire) * base.a;
+  col += emissive;
 
   // The River lights its banks.
   col += vec3(0.05, 0.42, 0.50) * exp(-max(rd, 0.0) * 1.5) * 0.45 * inField;
-  if (rd < 0.4) col = mix(col, water(p, rd), smoothstep(0.32, -0.06, rd) * inField);
+  float wet = rd < 0.4 ? smoothstep(0.32, -0.06, rd) * inField : 0.0;
+  vec3 stream = wet > 0.0 ? water(p, rd) : vec3(0.0);
+  col = mix(col, stream, wet);
 
-  gl_FragColor = vec4(mix(col, uVoid, smoothstep(3.4, 5.3, outside)), 1.0);
+  float fade = smoothstep(3.4, 5.3, outside);
+  vec3 lin = toLinear(mix(col, uVoid, fade));
+  // Energy past white, for the bloom: molten cracks, arcane veins and the brightest water.
+  lin += toLinear(emissive) * ${f(0.55)} * (1.0 - wet) * (1.0 - fade);
+  lin += vec3(0.08, 0.45, 0.60) * pow(max(stream.g - 0.78, 0.0) * 3.0, 2.0) * wet * (1.0 - fade);
+  gl_FragColor = vec4(lin, 1.0);
+  #include <colorspace_fragment>
 }
 `;
 
@@ -365,7 +395,7 @@ attribute vec4 aSeed;   // x: cycles per second, y: sway, z: phase, w: size in w
 attribute vec3 aColor;
 attribute float aRise;
 uniform float uTime;
-uniform float uPixels;  // device pixels per world unit
+uniform float uPixels;  // device pixels that one world unit covers at a distance of one unit
 varying vec3 vColor;
 varying float vAlpha;
 void main() {
@@ -377,16 +407,19 @@ void main() {
   vAlpha = sin(life * 3.14159) * (0.55 + 0.45 * sin(uTime * 4.0 + aSeed.z * 90.0));
   vColor = aColor;
   gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
-  gl_PointSize = max(aSeed.w * uPixels, 1.5);
+  // Nearer motes are drawn larger: this is what gives the air its depth.
+  gl_PointSize = max(aSeed.w * uPixels / gl_Position.w, 1.5);
 }
 `;
 
 const PARTICLE_FRAGMENT = /* glsl */ `
 varying vec3 vColor;
 varying float vAlpha;
+${GLSL_TO_LINEAR}
 void main() {
   float falloff = smoothstep(0.5, 0.0, length(gl_PointCoord - 0.5));
-  gl_FragColor = vec4(vColor, falloff * falloff * vAlpha);
+  gl_FragColor = vec4(toLinear(vColor) * ${f(1.6)}, falloff * falloff * vAlpha);
+  #include <colorspace_fragment>
 }
 `;
 
@@ -685,43 +718,115 @@ function runePad(p) {
   }
 }
 
+/**
+ * A hero, built from separately hinged parts so it can stride and swing: the
+ * legs pivot at the hips, the arms at the shoulders and the sword at the hand.
+ * The Aether Knight wears a winged, crested helm and carries a kite shield and
+ * a straight blade of light. Morgath is broader, horned and spiked, with a
+ * jagged molten greatsword.
+ */
 function buildHero(side, solidMaterial, glowMaterial, glowTexture) {
-  const solid = new Batch();
-  const glow = new Batch();
-  const p = pen(solid, glow);
   const radiant = side === 'radiant';
-  const cloth = radiant ? [0x1648b8, 0x58b8ff] : [0x8f141c, 0xff6a4a];
-  const light = radiant ? [0x59d2ff, 0xeaffff] : [0xff8a3a, 0xfff0c0];
-  const steel = [0x76849f, 0xe4eaf5];
-  const dark = [0x2c3550, 0x56627f];
-  const gold = [0xb98a2c, 0xf7e3a0];
+  const cloth = radiant ? [0x1648b8, 0x58b8ff] : [0x5a0c14, 0xc8381f];
+  const light = radiant ? [0x59d2ff, 0xeaffff] : [0xff6a1a, 0xffe6a8];
+  const steel = radiant ? [0x76849f, 0xe4eaf5] : [0x2b2433, 0x71607c];
+  const dark = radiant ? [0x2c3550, 0x56627f] : [0x141118, 0x3b3044];
+  const gold = radiant ? [0xb98a2c, 0xf7e3a0] : [0x7a2a14, 0xf0803a];
+  const size = radiant ? 1.3 : 1.4;
+  const girth = radiant ? 1 : 1.16;
 
-  for (const sx of [-1, 1]) {
-    p.box(dark[0], sx * 0.17, 0, 0.03, 0.24, 0.16, 0.38, { top: dark[1] });
-    p.box(steel[0], sx * 0.17, 0.14, 0, 0.2, 0.56, 0.24, { top: steel[1] });
-    p.rock(steel[1], sx * 0.5, 1.36, 0, 0.23, { top: 0xffffff, sy: 0.85 });
-    p.box(steel[0], sx * 0.55, 0.78, 0, 0.16, 0.52, 0.18, { top: steel[1] });
-  }
-  p.cyl(gold[0], 0, 0.66, 0, 0.33, 0.31, 0.1, 8, { top: gold[1] });
-  p.cyl(steel[0], 0, 0.74, 0, 0.44, 0.31, 0.66, 8, { top: steel[1] });
-  p.gem(light[0], 0, 1.0, 0.36, 0.09, 0.22, { glow: true, top: light[1] });
-  p.cyl(dark[0], 0, 1.4, 0, 0.13, 0.15, 0.1, 6, { top: dark[1] });
-  p.rock(steel[0], 0, 1.68, 0, 0.26, { top: 0xf4f7ff });
-  p.box(light[0], 0, 1.62, 0.2, 0.3, 0.07, 0.1, { glow: true, top: light[1] });
-  p.box(cloth[0], 0, 1.86, -0.04, 0.07, 0.3, 0.46, { top: cloth[1] });
-  p.box(cloth[0], 0, 0.4, -0.46, 0.74, 1.05, 0.06, { top: cloth[1], rx: 0.22 });
-  // Shield on the left arm, sword in the right hand.
-  p.cyl(gold[0], 0.62, 1.0, 0.2, 0.42, 0.42, 0.05, 10, { top: gold[1], rx: Math.PI / 2 });
-  p.cyl(cloth[0], 0.62, 1.0, 0.25, 0.34, 0.34, 0.04, 10, { top: cloth[1], rx: Math.PI / 2 });
-  p.box(gold[0], -0.62, 0.74, 0.2, 0.08, 0.2, 0.08, { top: gold[1] });
-  p.box(gold[0], -0.62, 0.94, 0.2, 0.36, 0.07, 0.1, { top: gold[1] });
-  p.box(light[0], -0.62, 1.0, 0.2, 0.12, 1.25, 0.04, { glow: true, top: light[1] });
-  p.cone(light[1], -0.62, 2.25, 0.2, 0.06, 0.18, 4, { glow: true });
+  /** One hinged part: `draw` places its shapes relative to the pivot at (x, y, z). */
+  const part = (x, y, z, draw) => {
+    const solid = new Batch();
+    const glow = new Batch();
+    draw(pen(solid, glow));
+    const group = new THREE.Group();
+    group.position.set(x, y, z);
+    if (solid.positions.length) {
+      const mesh = solid.build(solidMaterial);
+      mesh.castShadow = true;
+      group.add(mesh);
+    }
+    if (glow.positions.length) group.add(glow.build(glowMaterial));
+    return group;
+  };
+
+  const torso = part(0, 0, 0, (p) => {
+    p.cyl(gold[0], 0, 0.66, 0, 0.33 * girth, 0.31 * girth, 0.1, 8, { top: gold[1] });
+    p.cyl(steel[0], 0, 0.74, 0, 0.44 * girth, 0.31 * girth, 0.66, 8, { top: steel[1] });
+    p.gem(light[0], 0, 1.0, 0.36 * girth, 0.09, 0.22, { glow: true, top: light[1] });
+    p.cyl(dark[0], 0, 1.4, 0, 0.13, 0.15, 0.1, 6, { top: dark[1] });
+    p.rock(steel[0], 0, 1.68, 0, 0.26, { top: radiant ? 0xf4f7ff : steel[1] });
+    p.box(light[0], 0, 1.62, 0.2, 0.3, 0.07, 0.1, { glow: true, top: light[1] });
+    if (radiant) {
+      // Crest, helm wings and a full cape.
+      p.box(cloth[0], 0, 1.86, -0.04, 0.07, 0.34, 0.5, { top: cloth[1] });
+      for (const sx of [-1, 1]) {
+        p.rock(steel[1], sx * 0.5, 1.36, 0, 0.23, { top: 0xffffff, sy: 0.85 });
+        p.box(gold[0], sx * 0.27, 1.7, -0.06, 0.05, 0.34, 0.2, { top: gold[1], rz: -sx * 0.55 });
+      }
+      p.box(cloth[0], 0, 0.4, -0.46, 0.74, 1.05, 0.06, { top: cloth[1], rx: 0.22 });
+    } else {
+      // Horns, spiked pauldrons, a molten core and a cape in tatters.
+      for (const sx of [-1, 1]) {
+        p.cone(dark[1], sx * 0.2, 1.76, 0, 0.09, 0.5, 5, { top: gold[1], rz: -sx * 0.75 });
+        p.rock(dark[1], sx * 0.56, 1.38, 0, 0.29, { top: steel[1], sy: 0.85 });
+        p.cone(dark[0], sx * 0.62, 1.5, 0, 0.09, 0.42, 5, { top: gold[1], rz: -sx * 0.5 });
+        p.cone(dark[0], sx * 0.5, 1.56, -0.12, 0.07, 0.3, 5, { top: gold[1], rz: -sx * 0.2, rx: -0.4 });
+        p.box(light[0], sx * 0.16, 0.92, 0.37 * girth, 0.05, 0.3, 0.04, { glow: true, top: light[1], rz: sx * 0.35 });
+      }
+      [-0.26, 0, 0.26].forEach((x, i) => p.box(cloth[0], x, 0.42 + i * 0.12, -0.5, 0.22, 1.0 - i * 0.12, 0.05, { top: cloth[1], rx: 0.26 }));
+    }
+  });
+
+  const legs = [1, -1].map((sx) =>
+    part(sx * 0.17 * girth, 0.7, 0, (p) => {
+      p.box(dark[0], 0, -0.7, 0.03, 0.24, 0.16, 0.38, { top: dark[1] });
+      p.box(steel[0], 0, -0.56, 0, 0.2, 0.56, 0.24, { top: steel[1] });
+    }),
+  );
+
+  // Shield arm (the hero's left, +X).
+  const shieldArm = part(0.55 * girth, 1.3, 0, (p) => {
+    p.box(steel[0], 0, -0.52, 0, 0.16, 0.52, 0.18, { top: steel[1] });
+    if (radiant) {
+      p.cyl(gold[0], 0.07, -0.3, 0.2, 0.42, 0.42, 0.05, 10, { top: gold[1], rx: Math.PI / 2 });
+      p.cyl(cloth[0], 0.07, -0.3, 0.25, 0.34, 0.34, 0.04, 10, { top: cloth[1], rx: Math.PI / 2 });
+    } else {
+      p.cyl(dark[0], 0.07, -0.3, 0.2, 0.44, 0.44, 0.06, 7, { top: dark[1], rx: Math.PI / 2 });
+      p.cone(light[0], 0.07, -0.3, 0.26, 0.13, 0.26, 5, { glow: true, top: light[1], rx: Math.PI / 2 });
+      for (let i = 0; i < 7; i++) {
+        const a = (i / 7) * TAU;
+        p.cone(gold[0], 0.07 + Math.cos(a) * 0.4, -0.3 + Math.sin(a) * 0.4, 0.2, 0.05, 0.2, 4, { top: gold[1], rz: a - Math.PI / 2 });
+      }
+    }
+  });
+
+  // Sword arm (the hero's right, -X), with the blade hinged at the hand.
+  const swordArm = part(-0.55 * girth, 1.3, 0, (p) => p.box(steel[0], 0, -0.52, 0, 0.16, 0.52, 0.18, { top: steel[1] }));
+  const blade = part(-0.07, -0.5, 0.14, (p) => {
+    p.box(gold[0], 0, -0.1, 0, 0.08, 0.2, 0.08, { top: gold[1] });
+    if (radiant) {
+      p.box(gold[0], 0, 0.08, 0, 0.36, 0.07, 0.1, { top: gold[1] });
+      p.box(light[0], 0, 0.14, 0, 0.12, 1.25, 0.04, { glow: true, top: light[1] });
+      p.cone(light[1], 0, 1.39, 0, 0.06, 0.18, 4, { glow: true });
+    } else {
+      p.box(dark[0], 0, 0.08, 0, 0.46, 0.09, 0.12, { top: gold[1] });
+      p.box(dark[0], 0, 0.16, 0, 0.1, 1.3, 0.07, { top: dark[1] });
+      p.box(light[0], 0, 0.16, 0, 0.24, 1.36, 0.04, { glow: true, top: light[1] });
+      p.cone(light[1], 0, 1.52, 0, 0.12, 0.3, 4, { glow: true });
+      // Barbs down both edges.
+      for (const [y, sx] of [[0.5, 1], [0.78, -1], [1.06, 1], [1.3, -1]]) {
+        p.cone(light[0], sx * 0.12, y, 0, 0.07, 0.22, 4, { glow: true, top: light[1], rz: -sx * 1.2 });
+      }
+    }
+  });
+  swordArm.add(blade);
 
   const body = new THREE.Group();
-  body.add(solid.build(solidMaterial), glow.build(glowMaterial));
+  body.add(torso, ...legs, shieldArm, swordArm);
   body.rotation.y = radiant ? 0.75 : -0.75;
-  body.scale.setScalar(1.3);
+  body.scale.setScalar(size);
 
   // Team ring: four arcs that slowly turn under the hero's feet.
   const arcs = new Batch();
@@ -736,15 +841,16 @@ function buildHero(side, solidMaterial, glowMaterial, glowTexture) {
   );
   ring.position.y = 0.06;
 
+  // A soft contact shadow under the real one, so the feet never look detached.
   const shadow = new THREE.Mesh(
     new THREE.CircleGeometry(1.05, 24).rotateX(-Math.PI / 2),
-    new THREE.MeshBasicMaterial({ map: glowTexture, color: 0x000000, transparent: true, opacity: 0.6, depthWrite: false }),
+    new THREE.MeshBasicMaterial({ map: glowTexture, color: 0x000000, transparent: true, opacity: 0.45, depthWrite: false }),
   );
   shadow.position.y = 0.04;
 
   const group = new THREE.Group();
   group.add(shadow, ring, body);
-  return { group, body, ring };
+  return { group, body, ring, legs, shieldArm, swordArm, blade, size };
 }
 
 /** Trees, crystals, rocks and the rim that frames the arena. */
@@ -876,7 +982,7 @@ function scatterScenery(p, addHalo) {
 
 function buildParticles() {
   const random = seededRandom(77);
-  const count = 420;
+  const count = 760;
   const positions = new Float32Array(count * 3);
   const seeds = new Float32Array(count * 4);
   const colors = new Float32Array(count * 3);
@@ -907,6 +1013,24 @@ function buildParticles() {
       size = 0.07 + random() * 0.1;
       rises[i] = 4 + random() * 3;
       mix(0xff5a1a, 0xffc04a, random());
+    } else if (i < 480) {
+      // Fireflies over the Radiant woods: they wander at head height and blink rather than rise.
+      x = -3.5 - random() * 21;
+      y = 0.8 + random() * 3.6;
+      speed = 0.02 + random() * 0.03;
+      sway = 1.1 + random() * 1.6;
+      size = 0.13 + random() * 0.12;
+      rises[i] = (random() - 0.5) * 1.2;
+      mix(0xd8ff7a, 0xfff2a0, random());
+    } else if (i < 650) {
+      // Embers carried high over the Dire wastes, well above the units.
+      x = 3 + random() * 22;
+      y = 1 + random() * 3;
+      speed = 0.06 + random() * 0.1;
+      sway = 0.5 + random() * 0.9;
+      size = 0.09 + random() * 0.14;
+      rises[i] = 6 + random() * 6;
+      mix(0xff3a10, 0xffb040, random());
     } else {
       // River sparkles: low over the water.
       x = riverCenter(z) + (random() - 0.5) * 3.6;
@@ -962,13 +1086,26 @@ export function createBattlefield(canvas) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setClearColor(VOID_COLOR, 1);
+  // Units and heroes move, so the shadow map is redrawn every frame.
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.autoUpdate = false;
 
   const scene = new THREE.Scene();
-  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 240);
-  camera.position.set(0, SIN_P * 90, COS_P * 90);
+  const camera = new THREE.PerspectiveCamera(FOV, 1, 2, 400);
+  camera.position.set(0, SIN_P * 70, COS_P * 70);
   camera.lookAt(0, 0, 0);
+
+  // The frame is drawn in linear HDR, bloomed, then converted for the screen.
+  // A GPU without float render targets draws the scene directly instead.
+  let composer = null;
+  let bloomPass = null;
+  if (renderer.extensions.has('EXT_color_buffer_float')) {
+    composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.42, 0.3, 0.9);
+    composer.addPass(new RenderPass(scene, camera));
+    composer.addPass(bloomPass);
+    composer.addPass(new OutputPass());
+  }
+  const render = () => (composer ? composer.render() : renderer.render(scene, camera));
 
   scene.add(new THREE.HemisphereLight(0xdbeaff, 0x2a2233, 1.0));
   const sun = new THREE.DirectionalLight(0xfff0d8, 1.9);
@@ -983,12 +1120,16 @@ export function createBattlefield(canvas) {
 
   const solidMaterial = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.82, metalness: 0.04 });
   const glowMaterial = new THREE.MeshBasicMaterial({ vertexColors: true });
+  glowMaterial.color.setScalar(GLOW_BOOST);
 
+  // Glows are added in linear light, where a soft falloff spreads far wider than it does on screen.
+  // These ramps are the on-screen ones raised to the display gamma; the bloom pass supplies the outer haze.
   const glowTexture = canvasTexture(128, 128, (g, w) => {
     const gradient = g.createRadialGradient(w / 2, w / 2, 0, w / 2, w / 2, w / 2);
     gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
-    gradient.addColorStop(0.18, 'rgba(255, 255, 255, 0.7)');
-    gradient.addColorStop(0.45, 'rgba(255, 255, 255, 0.2)');
+    gradient.addColorStop(0.18, 'rgba(255, 255, 255, 0.46)');
+    gradient.addColorStop(0.3, 'rgba(255, 255, 255, 0.16)');
+    gradient.addColorStop(0.45, 'rgba(255, 255, 255, 0.04)');
     gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
     g.fillStyle = gradient;
     g.fillRect(0, 0, w, w);
@@ -996,13 +1137,16 @@ export function createBattlefield(canvas) {
   const beamTexture = canvasTexture(64, 256, (g, w, h) => {
     const rise = g.createLinearGradient(0, h, 0, 0);
     rise.addColorStop(0, 'rgba(255, 255, 255, 1)');
-    rise.addColorStop(0.35, 'rgba(255, 255, 255, 0.55)');
+    rise.addColorStop(0.35, 'rgba(255, 255, 255, 0.3)');
+    rise.addColorStop(0.7, 'rgba(255, 255, 255, 0.06)');
     rise.addColorStop(1, 'rgba(255, 255, 255, 0)');
     g.fillStyle = rise;
     g.fillRect(0, 0, w, h);
     const across = g.createLinearGradient(0, 0, w, 0);
     across.addColorStop(0, 'rgba(255, 255, 255, 0)');
+    across.addColorStop(0.25, 'rgba(255, 255, 255, 0.2)');
     across.addColorStop(0.5, 'rgba(255, 255, 255, 1)');
+    across.addColorStop(0.75, 'rgba(255, 255, 255, 0.2)');
     across.addColorStop(1, 'rgba(255, 255, 255, 0)');
     g.globalCompositeOperation = 'destination-in';
     g.fillStyle = across;
@@ -1049,7 +1193,7 @@ export function createBattlefield(canvas) {
     ),
   );
   // The terrain shader is unlit, so a transparent catcher just above it shows the shadows.
-  const shadowCatcher = new THREE.Mesh(groundGeometry, new THREE.ShadowMaterial({ color: 0x02040a, opacity: 0.42, depthWrite: false }));
+  const shadowCatcher = new THREE.Mesh(groundGeometry, new THREE.ShadowMaterial({ color: 0x02040a, opacity: 0.6, depthWrite: false }));
   shadowCatcher.position.y = 0.02;
   shadowCatcher.receiveShadow = true;
   scene.add(shadowCatcher);
@@ -1151,17 +1295,36 @@ export function createBattlefield(canvas) {
   scene.add(runeRing);
   const padHalo = addHalo(0, 0.6, 0, 6, 0x4fe6ff, 0.45);
 
-  const runeBatch = new Batch();
-  pen(runeBatch, runeBatch).gem(0xffa41a, 0, -0.55, 0, 0.42, 1.1, { glow: true, top: 0xfff6c8 });
-  const runeGem = runeBatch.build(glowMaterial);
+  // One floating gem per rune kind; only the kind waiting on the pad is shown.
+  const runeGems = {};
+  for (const [kind, low, high] of [['damage', 0xffa41a, 0xfff6c8], ['haste', 0x2fe08a, 0xe6fff2], ['regen', 0x8a5cff, 0xf0e6ff]]) {
+    const batch = new Batch();
+    pen(batch, batch).gem(low, 0, -0.55, 0, 0.42, 1.1, { glow: true, top: high });
+    runeGems[kind] = batch.build(glowMaterial);
+    scene.add(runeGems[kind]);
+  }
   const runeBeam = new THREE.Sprite(
-    new THREE.SpriteMaterial({ map: beamTexture, color: RUNE_COLOR, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false }),
+    new THREE.SpriteMaterial({ map: beamTexture, color: RUNE_COLOR.damage, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false }),
   );
   runeBeam.center.set(0.5, 0);
   runeBeam.scale.set(1.5, 6, 1);
   runeBeam.position.set(0, 0.45, 0);
-  const runeHalo = addHalo(0, 1.6, 0, 4.2, RUNE_COLOR, 0.7);
-  scene.add(runeGem, runeBeam);
+  const runeHalo = addHalo(0, 1.6, 0, 4.2, RUNE_COLOR.damage, 0.7);
+  scene.add(runeBeam);
+
+  // Where the hero has been told to walk: a green ring that stays until it arrives.
+  const waypoint = new THREE.Group();
+  {
+    const green = { color: 0x6dffa8, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, side: THREE.DoubleSide };
+    waypoint.add(
+      new THREE.Mesh(new THREE.RingGeometry(0.5, 0.62, 40).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ ...green, opacity: 0.9 })),
+      new THREE.Mesh(new THREE.RingGeometry(0.78, 0.84, 4).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ ...green, opacity: 0.55 })),
+      new THREE.Mesh(new THREE.CircleGeometry(0.14, 16).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ ...green, opacity: 0.9 })),
+    );
+    waypoint.visible = false;
+    waypoint.renderOrder = 4;
+    scene.add(waypoint);
+  }
 
   const particles = buildParticles();
   scene.add(particles.points);
@@ -1309,8 +1472,8 @@ export function createBattlefield(canvas) {
     sparks(x, 0.5, z, 0xffa033, 22, 7, 0.9, 0.42);
   }
 
-  /** Motes that drift upwards and fade, for healing. */
-  function rise(x, z, radius, color, count, duration) {
+  /** Motes that drift upwards and fade: healing light, or the sparks of a burning pillar when `speed` is high. */
+  function rise(x, z, radius, color, count, duration, speed = 1) {
     if (muted()) return;
     const material = new THREE.SpriteMaterial({ map: glowTexture, ...additive(color) });
     const bits = Array.from({ length: count }, () => {
@@ -1320,7 +1483,7 @@ export function createBattlefield(canvas) {
       sprite.position.set(x + Math.cos(angle) * reach, 0.1 + Math.random() * 0.7, z + Math.sin(angle) * reach);
       sprite.scale.setScalar(0.25 + Math.random() * 0.3);
       fxGroup.add(sprite);
-      return { sprite, speed: 1.4 + Math.random() * 2.2 };
+      return { sprite, speed: (1.4 + Math.random() * 2.2) * speed };
     });
     effect(
       duration,
@@ -1400,16 +1563,19 @@ export function createBattlefield(canvas) {
   const rayTexture = canvasTexture(64, 4, (g, w, h) => {
     const across = g.createLinearGradient(0, 0, w, 0);
     across.addColorStop(0, 'rgba(255, 255, 255, 0)');
+    across.addColorStop(0.25, 'rgba(255, 255, 255, 0.2)');
     across.addColorStop(0.5, 'rgba(255, 255, 255, 1)');
+    across.addColorStop(0.75, 'rgba(255, 255, 255, 0.2)');
     across.addColorStop(1, 'rgba(255, 255, 255, 0)');
     g.fillStyle = across;
     g.fillRect(0, 0, w, h);
   });
-  const VIEW_DIR = new THREE.Vector3(0, -SIN_P, -COS_P);
+  const VIEW_DIR = new THREE.Vector3();
 
   /** A straight beam between two points, drawn as a ribbon that faces the camera. */
   function ray(from, to, color, width, duration) {
     if (muted()) return;
+    VIEW_DIR.set((from.x + to.x) / 2, (from.y + to.y) / 2, (from.z + to.z) / 2).sub(camera.position);
     const across = new THREE.Vector3(to.x - from.x, to.y - from.y, to.z - from.z)
       .cross(VIEW_DIR)
       .normalize()
@@ -1486,6 +1652,327 @@ export function createBattlefield(canvas) {
     );
   }
 
+  /* ---------------------------------------------------------------- Hero abilities */
+
+  /** A colour pushed past white, so the bloom pass makes it glow. */
+  const hot = (hex, boost = 1.6) => new THREE.Color(hex).multiplyScalar(boost);
+
+  // A crescent that brightens from its tail to its leading edge. With additive
+  // blending black is invisible, so the gradient lives in the vertex colours.
+  const SLASH_SWEEP = 1.7;
+  const slashGeometry = (() => {
+    const segments = 26;
+    const positions = [];
+    const colors = [];
+    const index = [];
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+      const angle = SLASH_SWEEP * (0.5 - t);
+      const inner = 1 - 0.36 * Math.sin(Math.PI * t) ** 0.7;
+      const glow = t ** 1.6;
+      positions.push(Math.cos(angle) * inner, Math.sin(angle) * inner, 0, Math.cos(angle), Math.sin(angle), 0);
+      colors.push(0, 0, 0, glow, glow, glow);
+      if (i) index.push(i * 2 - 2, i * 2 - 1, i * 2 + 1, i * 2 - 2, i * 2 + 1, i * 2);
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    geometry.setIndex(index);
+    return geometry;
+  })();
+
+  /**
+   * A sword cut: a crescent of light swept round in front of a hero facing
+   * `facing`. The cut lies flat, so the camera above always sees its full arc;
+   * `cant` tips it off level (positive sweeps left to right, negative right to left).
+   */
+  function slash(x, y, z, facing, color, size, cant) {
+    if (muted()) return;
+    // Local X points the way the hero faces. The crescent is modelled upright and laid over onto its side.
+    const holder = new THREE.Group();
+    holder.position.set(x, y, z);
+    holder.rotation.y = facing - Math.PI / 2;
+    const plane = new THREE.Group();
+    plane.rotation.x = cant - Math.sign(cant) * (Math.PI / 2);
+    const outer = new THREE.Mesh(slashGeometry, new THREE.MeshBasicMaterial({ vertexColors: true, ...additive(hot(color, 2.2), 0), side: THREE.DoubleSide }));
+    const core = new THREE.Mesh(slashGeometry, new THREE.MeshBasicMaterial({ vertexColors: true, ...additive(hot(0xfff8e0, 1.6), 0), side: THREE.DoubleSide }));
+    outer.scale.setScalar(size);
+    core.scale.setScalar(size * 0.93);
+    plane.add(outer, core);
+    holder.add(plane);
+    holder.visible = false;
+    fxGroup.add(holder);
+    effect(
+      0.28,
+      (k) => {
+        holder.visible = true;
+        // The leading edge travels from behind one shoulder, across the front, and past the other.
+        const turn = 2.75 - 2.6 * easeOut(k);
+        outer.rotation.z = core.rotation.z = turn;
+        outer.material.opacity = Math.sin(Math.min(1, k * 3) * (Math.PI / 2)) * (1 - k * k);
+        core.material.opacity = outer.material.opacity * 0.8;
+      },
+      () => {
+        fxGroup.remove(holder);
+        outer.material.dispose();
+        core.material.dispose();
+      },
+    );
+  }
+
+  /** A camera-facing ribbon through `points` ([x, y, z] each): one stroke of lightning. */
+  function ribbonGeometry(points, width) {
+    const positions = [];
+    const uvs = [];
+    const index = [];
+    const last = points.length - 1;
+    points.forEach((point, i) => {
+      const before = points[Math.max(0, i - 1)];
+      const after = points[Math.min(last, i + 1)];
+      EDGE.set(after[0] - before[0], after[1] - before[1], after[2] - before[2]);
+      VIEW_DIR.set(point[0], point[1], point[2]).sub(camera.position);
+      EDGE.cross(VIEW_DIR).normalize().multiplyScalar(width / 2);
+      positions.push(point[0] - EDGE.x, point[1] - EDGE.y, point[2] - EDGE.z, point[0] + EDGE.x, point[1] + EDGE.y, point[2] + EDGE.z);
+      uvs.push(0, i / last, 1, i / last);
+      if (i) index.push(i * 2 - 2, i * 2 - 1, i * 2 + 1, i * 2 - 2, i * 2 + 1, i * 2);
+    });
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    geometry.setIndex(index);
+    return geometry;
+  }
+
+  /**
+   * Thunder Strike: jagged bolts fall from the sky onto (x, z), then arcs keep
+   * crawling over the ground for `linger` seconds, as long as the stun lasts.
+   */
+  function lightning(x, z, colors, radius, linger) {
+    if (muted()) return;
+    const jagged = (from, to, joints, wobble) =>
+      Array.from({ length: joints + 1 }, (_, i) => {
+        const t = i / joints;
+        // The kinks shrink towards the ground so the bolt lands on its mark.
+        const kink = i === 0 || i === joints ? 0 : wobble * (1 - t * 0.6);
+        return [
+          from[0] + (to[0] - from[0]) * t + (Math.random() - 0.5) * kink,
+          from[1] + (to[1] - from[1]) * t + (Math.random() - 0.5) * kink * 0.4,
+          from[2] + (to[2] - from[2]) * t + (Math.random() - 0.5) * kink * 0.5,
+        ];
+      });
+    const strike = (delay, life, power) => {
+      const sky = [x + (Math.random() - 0.5) * 6, 20, z - 2 + (Math.random() - 0.5) * 2];
+      const trunk = jagged(sky, [x, 0.1, z], 12, 2.2);
+      const strokes = [
+        [trunk, colors.bolt, 1.25, 0.8],
+        [trunk, colors.boltCore, 0.4, 1],
+      ];
+      // Forks split off the trunk and die out in the air.
+      for (const joint of [3, 6, 8]) {
+        const [fx0, fy0, fz0] = trunk[joint];
+        const reach = 2 + Math.random() * 2.5;
+        const fork = jagged(trunk[joint], [fx0 + (Math.random() - 0.5) * reach * 2, fy0 - reach * 1.2, fz0 + (Math.random() - 0.5) * reach], 4, 1);
+        strokes.push([fork, colors.bolt, 0.42, 0.7]);
+      }
+      const meshes = strokes.map(([points, color, width, opacity]) => {
+        const mesh = new THREE.Mesh(
+          ribbonGeometry(points, width),
+          new THREE.MeshBasicMaterial({ map: rayTexture, ...additive(hot(color, 1.9), 0), side: THREE.DoubleSide }),
+        );
+        mesh.userData.opacity = opacity * power;
+        mesh.frustumCulled = false;
+        mesh.visible = false;
+        fxGroup.add(mesh);
+        return mesh;
+      });
+      effect(
+        life,
+        (k) => {
+          const flicker = k < 0.2 ? 1 : 0.4 + 0.6 * Math.abs(Math.sin(k * 34));
+          for (const mesh of meshes) {
+            mesh.visible = true;
+            mesh.material.opacity = mesh.userData.opacity * flicker * (1 - k * k);
+          }
+        },
+        () => {
+          for (const mesh of meshes) {
+            fxGroup.remove(mesh);
+            mesh.geometry.dispose();
+            mesh.material.dispose();
+          }
+        },
+        delay,
+      );
+    };
+    strike(0, 0.3, 1);
+    strike(0.09, 0.26, 0.8);
+    strike(0.2, 0.3, 0.9);
+
+    flash(x, 1.2, z, colors.boltCore, radius * 2.6, 0.35);
+    flash(x, 0.8, z, colors.bolt, radius * 5, 0.65);
+    flash(x, 14, z - 2, colors.bolt, 10, 0.35);
+    ring(x, z, colors.boltCore, 0.3, radius, 0.32);
+    ring(x, z, colors.bolt, 0.3, radius * 1.15, 0.6, 0.06);
+    ring(x, z, colors.bolt, radius, radius, linger);
+    sparks(x, 0.5, z, colors.bolt, 22, 8, 0.8, 0.34);
+    sparks(x, 0.5, z, colors.boltCore, 10, 5, 0.6, 0.26);
+
+    let since = 0;
+    effect(linger, (_k, dt) => {
+      since += dt;
+      if (since < 0.08) return;
+      since = 0;
+      const angle = Math.random() * TAU;
+      const reach = Math.sqrt(Math.random()) * radius * 0.95;
+      const from = { x: x + Math.cos(angle) * reach, y: 0.12, z: z + Math.sin(angle) * reach };
+      const to = { x: from.x + (Math.random() - 0.5) * 1.8, y: 0.2 + Math.random() * 1.1, z: from.z + (Math.random() - 0.5) * 1.8 };
+      ray(from, to, colors.bolt, 0.2, 0.14);
+    });
+  }
+
+  // Streaks of light that thin out towards the sky; the columns of a pillar turn it about its axis.
+  const pillarTexture = canvasTexture(128, 256, (g, w, h) => {
+    const random = seededRandom(11);
+    for (let i = 0; i < 34; i++) {
+      g.fillStyle = `rgba(255, 255, 255, ${(0.12 + random() * 0.5).toFixed(3)})`;
+      g.fillRect(random() * w, 0, 1 + random() * 7, h);
+    }
+    const rise = g.createLinearGradient(0, h, 0, 0);
+    rise.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    rise.addColorStop(0.5, 'rgba(255, 255, 255, 0.5)');
+    rise.addColorStop(1, 'rgba(255, 255, 255, 0)');
+    g.globalCompositeOperation = 'destination-in';
+    g.fillStyle = rise;
+    g.fillRect(0, 0, w, h);
+  });
+  pillarTexture.wrapS = THREE.RepeatWrapping;
+  const pillarGeometry = new THREE.CylinderGeometry(1, 1, 1, 28, 1, true).translate(0, 0.5, 0);
+  const sealGeometry = new THREE.RingGeometry(0.86, 1, 6).rotateX(-Math.PI / 2);
+  const sigilGeometry = new THREE.RingGeometry(0.52, 0.6, 3).rotateX(-Math.PI / 2);
+  const poolGeometry = new THREE.CircleGeometry(1, 40).rotateX(-Math.PI / 2);
+  const PILLAR_HEIGHT = 30;
+
+  /**
+   * Divine Judgment: after `delay` seconds a pillar of light falls from orbit
+   * onto (x, z) and burns for `duration`, pulsing a shockwave on every damage tick.
+   */
+  function pillar(x, z, radius, colors, delay, duration, tick) {
+    if (muted()) return;
+    const lit = (geometry, color, boost, map) => {
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map, ...additive(hot(color, boost), 0), side: THREE.DoubleSide }));
+      mesh.frustumCulled = false;
+      return mesh;
+    };
+    const column = lit(pillarGeometry, colors.pillar, 1.1, pillarTexture);
+    const core = lit(pillarGeometry, colors.pillarCore, 1.3, pillarTexture);
+    const pool = lit(poolGeometry, colors.pillar, 1, glowTexture);
+    const seal = lit(sealGeometry, colors.pillar, 1.6);
+    const sigils = [lit(sigilGeometry, colors.pillarCore, 1.6), lit(sigilGeometry, colors.pillarCore, 1.6)];
+    const haze = new THREE.Sprite(new THREE.SpriteMaterial({ map: beamTexture, ...additive(colors.pillar, 0) }));
+    column.scale.set(radius * 0.5, PILLAR_HEIGHT, radius * 0.5);
+    core.scale.set(radius * 0.2, PILLAR_HEIGHT, radius * 0.2);
+    pool.scale.setScalar(radius * 1.15);
+    pool.position.y = 0.07;
+    seal.scale.setScalar(radius);
+    seal.position.y = 0.1;
+    sigils.forEach((sigil, i) => {
+      sigil.scale.setScalar(radius);
+      sigil.position.y = 0.11;
+      sigil.rotation.y = i * Math.PI;
+    });
+    haze.center.set(0.5, 0);
+    haze.scale.set(radius * 1.5, PILLAR_HEIGHT * COS_P, 1);
+    const group = new THREE.Group();
+    group.position.set(x, 0, z);
+    group.add(pool, seal, ...sigils, haze, column, core);
+    group.visible = false;
+    fxGroup.add(group);
+
+    // A closing circle warns of the strike; the pillar lands with the first tick of damage.
+    ring(x, z, colors.pillar, radius, radius * 0.3, delay);
+    ring(x, z, colors.pillarCore, radius * 1.05, radius * 1.05, delay);
+
+    let emitted = 0;
+    let ticks = 0;
+    effect(
+      duration,
+      (k, dt) => {
+        group.visible = true;
+        const t = k * duration;
+        const arrive = Math.min(1, t / 0.2);
+        const power = arrive * Math.min(1, (duration - t) / 0.5) * (0.86 + 0.14 * Math.sin(t * 24));
+        // The light falls out of the sky, then holds.
+        column.position.y = core.position.y = (1 - easeOut(arrive)) * PILLAR_HEIGHT;
+        column.rotation.y += dt * 1.5;
+        core.rotation.y -= dt * 2.6;
+        seal.rotation.y += dt * 0.8;
+        sigils[0].rotation.y -= dt * 1.6;
+        sigils[1].rotation.y -= dt * 1.6;
+        column.material.opacity = 0.42 * power;
+        core.material.opacity = 0.6 * power;
+        haze.material.opacity = 0.22 * power;
+        pool.material.opacity = 0.45 * power;
+        seal.material.opacity = 0.9 * power;
+        sigils[0].material.opacity = sigils[1].material.opacity = 0.8 * power;
+
+        emitted += dt;
+        if (emitted > 0.1) {
+          emitted = 0;
+          rise(x, z, radius * 0.85, colors.pillarCore, 8, 0.85, 5);
+        }
+        if (t >= ticks * tick) {
+          ticks++;
+          ring(x, z, colors.pillar, 0.5, radius, 0.45);
+          ring(x, z, colors.pillarCore, 0.3, radius * 0.7, 0.3);
+          sparks(x, 0.4, z, colors.pillar, 12, 7.5, 0.75, 0.3);
+          flash(x, 0.6, z, colors.pillarCore, radius * 1.1, 0.25);
+        }
+      },
+      () => {
+        fxGroup.remove(group);
+        for (const mesh of [column, core, pool, seal, ...sigils, haze]) mesh.material.dispose();
+        ring(x, z, colors.pillar, radius * 0.6, radius * 1.4, 0.5);
+        sparks(x, 0.6, z, colors.pillarCore, 18, 6, 0.9, 0.3);
+      },
+      delay,
+    );
+  }
+
+  /**
+   * A fading copy of a hero in the pose it holds right now, left where it stood:
+   * the afterimage of a dash or a blink. `facing` turns it, or null keeps the hero's own heading.
+   */
+  function ghost(side, x, z, facing, color, duration, delay = 0) {
+    if (muted()) return;
+    const hero = heroes[side];
+    const material = new THREE.MeshBasicMaterial(additive(hot(color, 1.2), 0));
+    const copy = hero.body.clone();
+    copy.traverse((node) => {
+      if (!node.isMesh) return;
+      node.material = material;
+      node.castShadow = false;
+    });
+    copy.position.set(x, groundHeight(x, z) + 0.05, z);
+    if (facing !== null) copy.rotation.set(0, facing, 0);
+    copy.visible = false;
+    fxGroup.add(copy);
+    effect(
+      duration,
+      (k) => {
+        copy.visible = true;
+        material.opacity = 0.6 * (1 - k) ** 1.5;
+        copy.scale.setScalar(hero.size * (1 + 0.08 * k));
+      },
+      () => {
+        fxGroup.remove(copy);
+        material.dispose();
+      },
+      delay,
+    );
+  }
+
+  let slashes = 0;
+
   const fx = {
     // Primitives the unit layer builds its attack and death effects from.
     bolt,
@@ -1495,6 +1982,34 @@ export function createBattlefield(canvas) {
     ring,
     flash,
     beam,
+    rise,
+
+    /** A hero's sword cut. Successive cuts come from alternate sides. */
+    heroSlash(side, x, y, z, facing) {
+      slash(x, y, z, facing, SPELL[side].slash, 1.9, slashes++ % 2 ? -0.32 : 0.32);
+    },
+
+    /** Lifesteal: life drawn out of the victim along a crimson thread back to the hero. */
+    drain(from, to) {
+      ray(from, to, LIFESTEAL_COLOR, 0.34, 0.26);
+      flash(to.x, to.y, to.z, LIFESTEAL_COLOR, 2.6, 0.32);
+      rise(to.x, to.z, 0.6, 0xff6a7a, 4, 0.6, 2);
+    },
+
+    /** An Aegis Shield giving out: the sphere bursts into shards. */
+    shieldBreak(side, x, y, z) {
+      const color = SPELL[side].shield;
+      sparks(x, y, z, color, 16, 5, 0.6, 0.3);
+      ring(x, z, color, 1.6, 2.6, 0.35);
+      flash(x, y, z, color, 4.5, 0.3);
+    },
+
+    /** Bounty paid for a kill: a burst of coins. The HUD floats the amount above it. */
+    gold(x, y, z) {
+      sparks(x, y, z, GOLD, 7, 3.4, 0.7, 0.26);
+      flash(x, y, z, 0xfff1b8, 2.2, 0.35);
+      ring(x, z, GOLD, 0.2, 1.1, 0.4);
+    },
 
     card(card, side, x, z) {
       const team = TEAM_COLOR[side];
@@ -1514,63 +2029,83 @@ export function createBattlefield(canvas) {
       }
     },
 
-    /** `event` is the server's cast event: where the hero stood (x, z) and where the ability landed (tx, tz). */
-    cast({ key, x, z, tx, tz }, ability) {
+    /** `event` is the server's cast event: who cast, where the hero stood (x, z) and where the ability landed (tx, tz). */
+    cast({ side, key, x, z, tx, tz }, ability) {
+      const colors = SPELL[side];
       if (key === 'Q') {
-        ray({ x, y: 1.1, z }, { x: tx, y: 1.1, z: tz }, 0x9fe9ff, 1.6, 0.4);
-        ring(tx, tz, 0x7fe3ff, 0.4, 2.2, 0.35);
-        flash(tx, 1.3, tz, 0xc8f6ff, 4.2, 0.3);
-        sparks(tx, 1, tz, 0x9fe9ff, 10, 5, 0.5);
+        // Slash Dash: afterimages down the path, a streak of light, and a wide cut where it ends.
+        const facing = Math.atan2(tx - x, tz - z);
+        for (let i = 0; i < 4; i++) {
+          ghost(side, x + ((tx - x) * i) / 4, z + ((tz - z) * i) / 4, facing, colors.slash, 0.55, i * 0.04);
+        }
+        ray({ x, y: 1.2, z }, { x: tx, y: 1.2, z: tz }, colors.slash, 1.8, 0.42);
+        ray({ x, y: 1.25, z }, { x: tx, y: 1.25, z: tz }, 0xfff8e0, 0.5, 0.3);
+        slash(tx, 1.3, tz, facing, colors.slash, 2.7, 0.5);
+        slash(tx, 1.3, tz, facing, colors.slash, 2.3, -0.5);
+        ring(tx, tz, colors.slash, 0.4, 2.4, 0.35);
+        flash(tx, 1.3, tz, 0xfff6d0, 4.6, 0.3);
+        sparks(tx, 1, tz, colors.slash, 14, 6, 0.55);
       } else if (key === 'W') {
-        ring(x, z, 0x6ab8ff, 0.4, 2.4, 0.5);
-        flash(x, 1.3, z, 0x6ab8ff, 4.5, 0.4);
+        // Aegis Shield: the sphere itself is drawn on the hero for as long as the shield holds.
+        ring(x, z, colors.shield, 0.4, 2.8, 0.5);
+        ring(x, z, 0xffffff, 0.3, 2.2, 0.35, 0.05);
+        beam(x, z, colors.shield, 2.4, 5, 0.5);
+        flash(x, 1.4, z, colors.shield, 6, 0.45);
+        sparks(x, 1.2, z, colors.shield, 12, 4, 0.6, 0.28);
       } else if (key === 'E') {
-        beam(tx, tz, 0xfff0a0, 1.3, 11, 0.45);
-        beam(tx, tz, 0xb9a0ff, 2.4, 11, 0.6, 0.05);
-        ring(tx, tz, 0xfff0a0, 0.3, ability.radius, 0.5);
-        flash(tx, 0.8, tz, 0xfff6d0, 5, 0.4);
-        sparks(tx, 0.4, tz, 0xd8c8ff, 14, 6, 0.7);
+        lightning(tx, tz, colors, ability.radius, ability.stunMs / 1000);
       } else if (key === 'R') {
-        // A closing circle warns of the strike; the pillar lands with the damage.
-        const delay = ability.delayMs / 1000;
-        ring(tx, tz, 0xffd766, ability.radius, ability.radius * 0.35, delay);
-        beam(tx, tz, 0xffe9a0, 3.6, 16, 1.1, delay);
-        beam(tx, tz, 0xffffff, 1.4, 16, 0.8, delay + 0.1);
-        for (let i = 0; i < 3; i++) ring(tx, tz, 0xffd766, 0.4, ability.radius, 0.9, delay + i * 0.18);
-        flash(tx, 1, tz, 0xfff0c0, 10, 0.9, delay);
-        effect(0.01, () => {}, () => sparks(tx, 0.5, tz, 0xffe08a, 26, 7, 1.1), delay);
+        pillar(tx, tz, ability.radius, colors, ability.delayMs / 1000, ability.durationMs / 1000, ability.tickMs / 1000);
       }
     },
 
-    item({ key, x, z, tx, tz }) {
-      if (key === 'Z') {
-        // Blink: a flash where the hero left and another where it lands.
-        ring(x, z, 0x7dffe6, 1.6, 0.2, 0.35);
-        flash(x, 1.2, z, 0x7dffe6, 3.5, 0.35);
-        ray({ x, y: 1.2, z }, { x: tx, y: 1.2, z: tz }, 0x7dffe6, 0.5, 0.3);
-        ring(tx, tz, 0x7dffe6, 0.3, 2, 0.4);
-        flash(tx, 1.2, tz, 0xb8fff4, 4, 0.4);
-        sparks(tx, 0.6, tz, 0xb8fff4, 10, 4, 0.6);
-      } else {
-        // Power Rune unleashed.
-        for (let i = 0; i < 2; i++) ring(x, z, RUNE_COLOR, 0.3, 3, 0.6, i * 0.15);
-        beam(x, z, RUNE_COLOR, 1.8, 8, 0.8);
-        sparks(x, 1, z, 0xffe9a0, 16, 5, 0.9);
+    /** `event` is the server's item event: a relic bought, a blink from (x, z) to (tx, tz), or a rune drunk. */
+    item({ side, key, x, z, tx, tz, bought, rune }) {
+      const colors = SPELL[side];
+      if (bought) {
+        const color = key === 'Z' ? colors.blink : LIFESTEAL_COLOR;
+        for (let i = 0; i < 2; i++) ring(x, z, color, 0.3, 2.6, 0.6, i * 0.14);
+        beam(x, z, color, 1.6, 7, 0.8);
+        flash(x, 1.3, z, color, 5, 0.5);
+        sparks(x, 1.2, z, GOLD, 16, 5, 0.9, 0.28);
+      } else if (key === 'Z') {
+        // Blink Boots: the hero winks out in a flash, leaving a ghost, and arrives in a brighter one.
+        ghost(side, x, z, null, colors.blink, 0.5);
+        ring(x, z, colors.blink, 1.8, 0.2, 0.3);
+        beam(x, z, colors.blink, 0.9, 9, 0.35);
+        flash(x, 1.2, z, colors.blinkCore, 5, 0.3);
+        ray({ x, y: 1.2, z }, { x: tx, y: 1.2, z: tz }, colors.blink, 0.45, 0.28);
+        flash(tx, 1.2, tz, colors.blinkCore, 5.5, 0.45);
+        flash(tx, 1.2, tz, colors.blink, 7.5, 0.65);
+        ring(tx, tz, colors.blink, 0.3, 2.8, 0.45);
+        ring(tx, tz, 0xffffff, 0.2, 1.8, 0.3, 0.04);
+        beam(tx, tz, colors.blink, 1.7, 10, 0.5);
+        sparks(tx, 0.8, tz, colors.blinkCore, 16, 5, 0.6);
+      } else if (rune) {
+        // The bottled rune, drunk.
+        const color = RUNE_COLOR[rune];
+        for (let i = 0; i < 3; i++) ring(x, z, color, 0.3, 3.2, 0.6, i * 0.13);
+        beam(x, z, color, 2, 9, 0.8);
+        flash(x, 1.3, z, color, 6.5, 0.5);
+        sparks(x, 1, z, color, 18, 5.5, 0.9);
+        rise(x, z, 1.4, color, 14, 1.1, 1.6);
       }
     },
 
-    rune() {
-      beam(0, 0, RUNE_COLOR, 2.6, 13, 1.2);
-      ring(0, 0, RUNE_COLOR, 0.4, 3.4, 0.9);
+    rune(kind) {
+      const color = RUNE_COLOR[kind];
+      beam(0, 0, color, 2.6, 13, 1.2);
+      ring(0, 0, color, 0.4, 3.4, 0.9);
       ring(0, 0, 0xffffff, 0.4, 3.4, 1.1, 0.15);
-      flash(0, 1.4, 0, RUNE_COLOR, 7, 0.8);
-      sparks(0, 1, 0, 0xffe9a0, 20, 5, 1.0);
+      flash(0, 1.4, 0, color, 7, 0.8);
+      sparks(0, 1, 0, color, 20, 5, 1.0);
     },
 
-    runeTaken() {
-      ring(0, 0, RUNE_COLOR, 2.4, 0.3, 0.45);
-      flash(0, 1.6, 0, 0xfff6c8, 6, 0.5);
-      sparks(0, 1.4, 0, 0xffe9a0, 18, 6, 0.9);
+    runeTaken(kind) {
+      const color = RUNE_COLOR[kind];
+      ring(0, 0, color, 2.4, 0.3, 0.45);
+      flash(0, 1.6, 0, color, 6, 0.5);
+      sparks(0, 1.4, 0, color, 18, 6, 0.9);
     },
 
     ping(x, z) {
@@ -1581,8 +2116,9 @@ export function createBattlefield(canvas) {
     /** A closing ring where the hero was told to go (or, in red, whom to attack). */
     marker(x, z, hostile) {
       const color = hostile ? 0xff5a4a : 0x6dffa8;
-      ring(x, z, color, 1.1, 0.25, 0.32);
-      ring(x, z, color, 0.7, 0.2, 0.32, 0.08);
+      ring(x, z, color, 1.3, 0.3, 0.34);
+      ring(x, z, color, 0.8, 0.2, 0.34, 0.08);
+      flash(x, 0.2, z, color, 1.8, 0.3);
     },
 
     /** A structure takes a hit: it shudders, and flashes if the blow was heavy. */
@@ -1620,6 +2156,8 @@ export function createBattlefield(canvas) {
     pitch: PITCH,
     heroes,
     fx,
+    colors: { spell: SPELL, rune: RUNE_COLOR, lifesteal: LIFESTEAL_COLOR },
+    glowTexture,
     // Attacks aimed at a Tower or Throne land part-way up it; a fallen one is no target.
     structurePoint(id) {
       const view = structureList[-id - 1];
@@ -1640,13 +2178,47 @@ export function createBattlefield(canvas) {
   let cpuMs = 0;
   /** Render-resolution multiplier. It steps down if frames run long, to hold 60 FPS on weak GPUs. */
   let quality = 1;
+  /** Set from the console (runedeck.lockQuality) to keep full quality whatever the frame rate. */
+  let qualityLocked = false;
   let sampleFrames = 0;
   let sampleTime = 0;
+  const tanHalfFov = Math.tan(THREE.MathUtils.degToRad(FOV) / 2);
 
   function applyResolution() {
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2) * quality);
+    const ratio = Math.min(window.devicePixelRatio || 1, 2) * quality;
+    renderer.setPixelRatio(ratio);
     renderer.setSize(width, height, false);
-    particles.uniforms.uPixels.value = pixelsPerUnit * renderer.getPixelRatio();
+    if (composer) {
+      composer.setPixelRatio(ratio);
+      composer.setSize(width, height);
+      // Bloom is the first thing a struggling GPU gives up.
+      bloomPass.enabled = quality > 0.7;
+    }
+    particles.uniforms.uPixels.value = (height * ratio) / (2 * tanHalfFov);
+  }
+
+  /** Corners the camera must keep in view: the field on the ground, and head-room for what stands at the back. */
+  const FRAME_POINTS = [-1, 1].flatMap((side) => [
+    [side * (MAP.halfWidth + 1.2), 0, MAP.halfDepth + 0.7],
+    [side * (MAP.halfWidth + 1.2), 0, -MAP.halfDepth - 0.4],
+    [side * (MAP.halfWidth + 1.2), 2.6, -MAP.halfDepth],
+    [side * MAP.towerX, 6.6, -MAP.laneZ],
+  ]);
+
+  /** Bounds of those corners in normalised screen space, with the camera `distance` from the field's centre. */
+  function frameAt(distance) {
+    camera.position.set(0, SIN_P * distance, COS_P * distance);
+    camera.lookAt(0, 0, 0);
+    camera.updateMatrixWorld();
+    camera.updateProjectionMatrix();
+    const box = { halfWidth: 0, top: -Infinity, bottom: Infinity };
+    for (const [x, y, z] of FRAME_POINTS) {
+      A.set(x, y, z).project(camera);
+      box.halfWidth = Math.max(box.halfWidth, Math.abs(A.x));
+      box.top = Math.max(box.top, A.y);
+      box.bottom = Math.min(box.bottom, A.y);
+    }
+    return box;
   }
 
   const api = {
@@ -1662,20 +2234,27 @@ export function createBattlefield(canvas) {
     resize(nextWidth, nextHeight, insets = { top: 0, bottom: 0 }) {
       width = Math.max(1, nextWidth);
       height = Math.max(1, nextHeight);
-
-      const up = MAP.halfDepth * SIN_P + 2.4 * COS_P + 0.3;
-      const down = MAP.halfDepth * SIN_P + 0.5;
       const safeHeight = Math.max(height - insets.top - insets.bottom, 120);
-      pixelsPerUnit = Math.min(width / ((MAP.halfWidth + 1.2) * 2), safeHeight / (up + down));
-      // Shift the view so the field's centre lands in the middle of the free area.
-      const offset = (insets.top + safeHeight * (up / (up + down)) - height / 2) / pixelsPerUnit;
-      camera.left = -width / (2 * pixelsPerUnit);
-      camera.right = width / (2 * pixelsPerUnit);
-      camera.top = height / (2 * pixelsPerUnit) + offset;
-      camera.bottom = -height / (2 * pixelsPerUnit) + offset;
-      camera.updateProjectionMatrix();
+
+      // Pull the camera back along its line of sight until the field just fits the free area.
+      camera.clearViewOffset();
+      camera.aspect = width / height;
+      let near = 20;
+      let far = 320;
+      for (let i = 0; i < 24; i++) {
+        const distance = (near + far) / 2;
+        const box = frameAt(distance);
+        if (box.halfWidth <= 1 && (box.top - box.bottom) * 0.5 * height <= safeHeight) far = distance;
+        else near = distance;
+      }
+      const box = frameAt(far);
+      // Then slide the picture, as a shift lens would, so the field sits in the middle of that area.
+      const centre = (0.5 - (box.top + box.bottom) / 4) * height;
+      camera.setViewOffset(width, height, 0, centre - (insets.top + safeHeight / 2), width, height);
+      // Scale at the centre of the field; nearer things are drawn larger and farther ones smaller.
+      pixelsPerUnit = height / (2 * far * tanHalfFov);
       applyResolution();
-      if (!running) renderer.render(scene, camera);
+      if (!running) render();
     },
 
     start() {
@@ -1710,9 +2289,9 @@ export function createBattlefield(canvas) {
         view.halo.visible = true;
       }
       units.clear();
-      api.setRune(false);
+      api.setRune(null);
+      api.setWaypoint(null);
       api.setPreview(null);
-      renderer.shadowMap.needsUpdate = true;
     },
 
     /**
@@ -1738,9 +2317,12 @@ export function createBattlefield(canvas) {
     pickTarget(x, z, side) {
       const id = units.pick(x, z, side);
       if (id) return id;
-      const index = structureList.findIndex(
-        ({ def, collapse }) => def.side !== side && collapse < 0 && Math.hypot(def.x - x, def.z - z) < def.radius + 0.3,
-      );
+      // As with units, a click anywhere up a Tower's height counts.
+      const index = structureList.findIndex(({ def, collapse }) => {
+        if (def.side === side || collapse >= 0) return false;
+        const nearest = Math.min(def.z, Math.max(def.z - (def.height * 0.8) / Math.tan(PITCH), z));
+        return Math.hypot(def.x - x, nearest - z) < def.radius + 0.3;
+      });
       return index === -1 ? 0 : -(index + 1);
     },
 
@@ -1758,10 +2340,19 @@ export function createBattlefield(canvas) {
       return raycaster.ray.intersectPlane(groundPlane, B) ? { x: B.x, z: B.z } : null;
     },
 
-    setRune(active) {
-      runeGem.visible = active;
-      runeBeam.visible = active;
-      runeHalo.visible = active;
+    /** Shows the rune waiting on the River pad: a kind from RUNES, or null for an empty pad. */
+    setRune(kind) {
+      for (const name in runeGems) runeGems[name].visible = name === kind;
+      runeBeam.visible = runeHalo.visible = Boolean(kind);
+      if (!kind) return;
+      runeBeam.material.color.set(RUNE_COLOR[kind]);
+      runeHalo.material.color.set(RUNE_COLOR[kind]);
+    },
+
+    /** Marks where the hero is walking to ({ x, z }), or clears the mark with null. */
+    setWaypoint(point) {
+      waypoint.visible = Boolean(point);
+      if (point) waypoint.position.set(point.x, groundHeight(point.x, point.z) + 0.09, point.z);
     },
 
     /** `preview` is null or { x, z, radius, valid, side, restricted }. */
@@ -1784,9 +2375,19 @@ export function createBattlefield(canvas) {
       }
     },
 
+    /** Diagnostics: hold full resolution and bloom even when the frame rate drops. */
+    lockQuality(locked = true) {
+      qualityLocked = locked;
+      if (locked && quality !== 1) {
+        quality = 1;
+        applyResolution();
+      }
+    },
+
     stats() {
       return {
         fps: Math.round(fps),
+        quality,
         cpuMs: +cpuMs.toFixed(2),
         calls: renderer.info.render.calls,
         triangles: renderer.info.render.triangles,
@@ -1804,7 +2405,8 @@ export function createBattlefield(canvas) {
     if (!running) return;
     frameId = requestAnimationFrame(frame);
     const began = performance.now();
-    const dt = Math.min((now - lastTime) / 1000, 0.1);
+    // A frame queued before start() carries an older timestamp; time must never run backwards.
+    const dt = Math.min(Math.max(0, (now - lastTime) / 1000), 0.1);
     lastTime = now;
     time += dt;
     if (dt > 0) fps += (1 / dt - fps) * 0.08;
@@ -1814,7 +2416,7 @@ export function createBattlefield(canvas) {
     if (++sampleFrames > 0) {
       sampleTime += dt;
       if (sampleFrames >= 60) {
-        if (sampleTime / sampleFrames > 1 / 45 && quality > 0.5) {
+        if (sampleTime / sampleFrames > 1 / 45 && quality > 0.5 && !qualityLocked) {
           quality = Math.max(0.5, quality - 0.17);
           applyResolution();
         }
@@ -1843,7 +2445,6 @@ export function createBattlefield(canvas) {
         if (view.collapse === 1) {
           view.group.visible = false;
           view.ruins.visible = true;
-          renderer.shadowMap.needsUpdate = true;
         }
       }
     }
@@ -1860,8 +2461,15 @@ export function createBattlefield(canvas) {
 
     runeRing.rotation.y = time * 0.5;
     runeRing.material.opacity = 0.5 + 0.25 * Math.sin(time * 2);
-    runeGem.position.y = 1.75 + Math.sin(time * 2) * 0.16;
-    runeGem.rotation.y = time * 1.6;
+    for (const name in runeGems) {
+      runeGems[name].position.y = 1.75 + Math.sin(time * 2) * 0.16;
+      runeGems[name].rotation.y = time * 1.6;
+    }
+    pillarTexture.offset.x = time * 0.3;
+    if (waypoint.visible) {
+      waypoint.scale.setScalar(1 + 0.12 * Math.sin(time * 7));
+      waypoint.rotation.y = time * 1.2;
+    }
     padHalo.material.opacity = 0.4 + 0.12 * Math.sin(time * 2);
 
     for (const halo of halos) {
@@ -1884,7 +2492,7 @@ export function createBattlefield(canvas) {
     }
 
     api.onFrame?.(dt, now);
-    renderer.render(scene, camera);
+    render();
     cpuMs += (performance.now() - began - cpuMs) * 0.1;
   }
 

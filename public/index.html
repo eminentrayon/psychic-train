@@ -12,7 +12,7 @@
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;900&family=Rajdhani:wght@500;600;700&display=swap">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="hud.css">
-  <script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+  <script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js", "three/addons/": "/vendor/three/addons/" } }</script>
 </head>
 <body data-phase="lobby">
   <canvas id="backdrop" aria-hidden="true"></canvas>
@@ -151,7 +151,7 @@
           <span class="side-sigil" id="sigil-radiant"></span>
           <strong class="side-name" id="name-radiant"></strong>
           <span class="side-tag" id="tag-radiant"></span>
-          <span class="side-hero">Aether Knight</span>
+          <span class="side-hero" id="hero-radiant">Aether Knight</span>
         </section>
         <div class="versus-vs" aria-hidden="true">VS</div>
         <section class="side-card dire" id="side-dire">
@@ -159,7 +159,7 @@
           <span class="side-sigil" id="sigil-dire"></span>
           <strong class="side-name" id="name-dire"></strong>
           <span class="side-tag" id="tag-dire"></span>
-          <span class="side-hero">Aether Knight</span>
+          <span class="side-hero" id="hero-dire">Morgath</span>
         </section>
       </div>
 
@@ -172,6 +172,7 @@
   <!-- ===================================================== In-game: battlefield and HUD -->
   <div class="game" id="game" hidden>
     <canvas class="battlefield" id="battlefield"></canvas>
+    <div class="vignette" aria-hidden="true"></div>
     <div class="world-layer" id="world-layer" aria-hidden="true"></div>
 
     <div class="hud" id="hud">
@@ -206,7 +207,7 @@
           <div class="gold" title="Gold"><i class="coin"></i><span id="hud-gold">0</span></div>
         </div>
         <div class="hero-main">
-          <div class="hero-title"><strong id="hud-hero-name">Aether Knight</strong><span id="hud-player-name"></span></div>
+          <div class="hero-title"><strong id="hud-hero-name">Aether Knight</strong><span class="buffs" id="hud-buffs" aria-live="polite"></span><span id="hud-player-name"></span></div>
           <div class="stat hp" id="stat-hp" title="Health"><i class="stat-ghost"></i><i class="stat-fill"></i><b></b></div>
           <div class="stat mana" id="stat-mana" title="Mana"><i class="stat-fill"></i><b></b></div>
           <div class="skills">

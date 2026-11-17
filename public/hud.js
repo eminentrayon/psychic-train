@@ -2,15 +2,17 @@
  * RuneDeck — in-game HUD (DOM overlay over the battlefield canvas).
  *
  * Top bar (team health, clock, rune timer), hero panel (portrait, bars,
- * abilities, items), card dock (hand, next card, Elixir), combat feed, minimap
- * and the health bars that float above structures and heroes.
+ * abilities, relics and their gold locks, the rune bottle, running buffs),
+ * card dock (hand, next card, Elixir), combat feed, minimap, the health bars
+ * that float above structures and heroes, and the gold that floats up from a kill.
  *
  * `render(view, now)` runs every frame, so it only touches the DOM when a
  * displayed value actually changes.
  */
 
-import { ABILITY_ICONS, CARD_ICONS, HERO_PORTRAIT, ITEM_ICONS, SIGILS, svgUrl } from './art.js';
-import { DECK, FLAG, HERO, MAP, MATCH, SIDES, STRUCTURES, UNIT_TYPES, riverCenter } from './shared.js';
+import { SIGILS, svgUrl } from './art.js';
+import { cardArt, iconArt, portraitArt } from './paint.js';
+import { DECK, FLAG, HERO, HEROES, MAP, MATCH, RUNES, SIDES, STRUCTURES, UNIT_TYPES, riverCenter } from './shared.js';
 
 const CARDS = new Map(DECK.map((card) => [card.id, card]));
 const HERO_TYPE = UNIT_TYPES.indexOf('hero');
@@ -22,6 +24,10 @@ const FEED_LIFETIME_MS = 7_000;
 const MINIMAP_W = (MAP.halfWidth + 1) * 2;
 const MINIMAP_D = (MAP.halfDepth + 0.8) * 2;
 const TEAM_CSS = { radiant: '#4fc3ff', dire: '#ff5a36' };
+const RUNE_CSS = { damage: '#ffa41a', haste: '#5dffb0', regen: '#b48cff' };
+/** How long a "+25g" stays in the air, and how many may float at once. */
+const FLOAT_MS = 1_250;
+const FLOAT_LIMIT = 14;
 const TAU = Math.PI * 2;
 
 const $ = (id) => document.getElementById(id);
@@ -33,9 +39,9 @@ function el(tag, className, text) {
   return node;
 }
 
-function image(markup, alt = '') {
+function image(src, alt = '') {
   const node = el('img');
-  node.src = svgUrl(markup);
+  node.src = src;
   node.alt = alt;
   node.draggable = false;
   return node;
@@ -63,6 +69,9 @@ export function createHud() {
     heroPanel: $('hero-panel'),
     level: $('hud-level'),
     gold: $('hud-gold'),
+    portrait: $('hud-portrait'),
+    heroName: $('hud-hero-name'),
+    buffs: $('hud-buffs'),
     playerName: $('hud-player-name'),
     minimap: $('minimap'),
     dock: $('dock'),
@@ -86,7 +95,7 @@ export function createHud() {
   const teams = {};
   for (const side of SIDES) {
     const root = $(`team-${side}`);
-    root.querySelector('.team-crest').replaceChildren(image(SIGILS[side]));
+    root.querySelector('.team-crest').replaceChildren(image(svgUrl(SIGILS[side])));
     teams[side] = {
       root,
       name: root.querySelector('.team-player'),
@@ -100,8 +109,6 @@ export function createHud() {
 
   /* ---------------------------------------------------------------- Hero panel */
 
-  $('hud-portrait').src = svgUrl(HERO_PORTRAIT);
-  $('hud-hero-name').textContent = HERO.name;
   const hpBar = { fill: $('stat-hp').querySelector('.stat-fill'), ghost: $('stat-hp').querySelector('.stat-ghost'), text: $('stat-hp').querySelector('b') };
   const manaBar = { fill: $('stat-mana').querySelector('.stat-fill'), text: $('stat-mana').querySelector('b') };
 
@@ -109,26 +116,35 @@ export function createHud() {
     const button = el('button', `skill ${className}`);
     button.type = 'button';
     button.dataset.key = def.key;
-    button.title = `${def.name} [${def.key}]${def.manaCost ? ` · ${def.manaCost} mana` : ''}\n${def.description}`;
+    const title = `${def.name} [${def.key}]${def.manaCost ? ` · ${def.manaCost} mana` : ''}\n${def.description}`;
+    button.title = title;
+    const art = image(icon, def.name);
     const cd = el('i', 'skill-cd');
     const cdText = el('b', 'skill-cd-text');
-    button.append(image(icon, def.name), cd, cdText, el('kbd', '', def.key));
+    button.append(art, cd, cdText, el('kbd', '', def.key));
     if (def.manaCost) button.append(el('span', 'skill-cost', String(def.manaCost)));
-    return { def, button, cd, cdText, cooling: false, lowMana: false, shown: '' };
+    if (def.cost) {
+      // A relic stays under its price tag until it is bought.
+      const lock = el('span', 'skill-lock');
+      lock.append(el('i', 'coin'), el('b', '', String(def.cost)));
+      button.append(lock);
+    }
+    return { def, button, art, title, cd, cdText, cooling: false, lowMana: false, shown: '', locked: null, affordable: null };
   }
 
   const slots = new Map();
   for (const ability of HERO.abilities) {
-    const slot = buildSlot(ability, ABILITY_ICONS[ability.id], ability.ultimate ? 'ability ultimate' : 'ability');
+    const slot = buildSlot(ability, iconArt(ability.id), ability.ultimate ? 'ability ultimate' : 'ability');
     slots.set(ability.key, slot);
     $('abilities').append(slot.button);
   }
   for (const item of HERO.items) {
-    const slot = buildSlot(item, ITEM_ICONS[item.id], item.holdsRune ? 'item empty' : 'item');
+    const slot = buildSlot(item, iconArt(item.id), item.holdsRune ? 'item empty' : 'item');
     slots.set(item.key, slot);
     $('items').append(slot.button);
   }
   const runeSlot = slots.get(HERO.items.find((item) => item.holdsRune).key);
+  const relicSlots = [...slots.values()].filter((slot) => slot.def.cost);
 
   /* ---------------------------------------------------------------- Card dock */
 
@@ -150,7 +166,7 @@ export function createHud() {
   function fillCard(view, card) {
     view.root.className = view.root.className.replace(/\btype-\w+/g, '').trim();
     view.root.classList.add(`type-${card.type.toLowerCase()}`);
-    view.art.src = svgUrl(CARD_ICONS[card.id] ?? CARD_ICONS.unknown);
+    view.art.src = cardArt(card.id);
     view.name.textContent = card.name;
     view.costText.textContent = String(card.cost);
     view.root.title = `${card.name} · ${card.cost} Elixir · ${card.type}\n${card.description}`;
@@ -201,6 +217,29 @@ export function createHud() {
     const scale = `scaleX(${Math.max(0, Math.min(1, fraction)).toFixed(4)})`;
     bar.fill.style.transform = scale;
     if (bar.ghost) bar.ghost.style.transform = scale;
+  }
+
+  /* ---------------------------------------------------------------- Floating text */
+
+  /** World to CSS pixels; the match controller supplies it with every layout. */
+  let projectWorld = null;
+  const floats = [];
+
+  function drawFloats(now) {
+    for (let i = floats.length - 1; i >= 0; i--) {
+      const item = floats[i];
+      const k = (now - item.at) / FLOAT_MS;
+      if (k >= 1 || !projectWorld) {
+        item.node.remove();
+        floats.splice(i, 1);
+        continue;
+      }
+      // Pops, climbs, then fades.
+      const point = projectWorld(item.x, item.y + Math.max(0, k) * 1.7, item.z);
+      const pop = 1 + 0.35 * Math.sin(Math.min(1, Math.max(0, k) * 5) * Math.PI);
+      item.node.style.transform = `translate(${point.x.toFixed(1)}px, ${point.y.toFixed(1)}px) translate(-50%, -50%) scale(${pop.toFixed(3)})`;
+      item.node.style.opacity = k < 0.6 ? '1' : (1 - (k - 0.6) / 0.4).toFixed(2);
+    }
   }
 
   /* ---------------------------------------------------------------- Minimap */
@@ -275,12 +314,12 @@ export function createHud() {
 
     g.drawImage(mapBase, 0, 0);
 
-    // Rune pad: gold and pulsing while a rune waits on it.
-    diamond(0, 0, (view.runeActive ? 1.9 + 0.35 * Math.sin(now / 180) : 1.6) * sx);
-    g.fillStyle = view.runeActive ? '#ffc94a' : '#0b3a52';
+    // Rune pad: lit in the rune's colour and pulsing while one waits on it.
+    diamond(0, 0, (view.rune ? 1.9 + 0.35 * Math.sin(now / 180) : 1.6) * sx);
+    g.fillStyle = view.rune ? RUNE_CSS[view.rune] : '#0b3a52';
     g.fill();
     g.lineWidth = 0.3 * sx;
-    g.strokeStyle = view.runeActive ? '#fff6c8' : '#9ff7ff';
+    g.strokeStyle = view.rune ? '#ffffff' : '#9ff7ff';
     g.stroke();
 
     STRUCTURES.forEach((s, i) => {
@@ -351,11 +390,14 @@ export function createHud() {
       els.timer.classList.toggle('urgent', seconds <= 30);
     }
     const runeSeconds = Math.ceil(view.runeInMs / 1000);
-    if (runeSeconds !== last.runeSeconds || view.runeActive !== last.runeActive) {
+    if (runeSeconds !== last.runeSeconds || view.rune !== last.padRune) {
       last.runeSeconds = runeSeconds;
-      last.runeActive = view.runeActive;
-      els.runeText.textContent = `Rune ${Math.floor(runeSeconds / 60)}:${String(runeSeconds % 60).padStart(2, '0')}`;
-      els.rune.classList.toggle('up', view.runeActive);
+      last.padRune = view.rune;
+      els.runeText.textContent = view.rune
+        ? `${RUNES[view.rune].name} is up`
+        : `Rune ${Math.floor(runeSeconds / 60)}:${String(runeSeconds % 60).padStart(2, '0')}`;
+      els.rune.classList.toggle('up', Boolean(view.rune));
+      els.rune.style.setProperty('--rune', view.rune ? RUNE_CSS[view.rune] : '');
     }
 
     // Structure bars and the team totals they add up to.
@@ -392,11 +434,53 @@ export function createHud() {
       last.foeHp = foeHp;
       setBar(heroBars[me === 'radiant' ? 'dire' : 'radiant'], foeHp / HERO.maxHp);
     }
-    // The rune slot lights up while a Power Rune is stored.
+    // The bottle fills with the colour of the rune it holds.
     if (view.hero.rune !== last.rune) {
-      last.rune = view.hero.rune;
-      runeSlot.button.classList.toggle('empty', !view.hero.rune);
-      runeSlot.button.classList.toggle('charged', view.hero.rune);
+      const kind = view.hero.rune;
+      last.rune = kind;
+      runeSlot.art.src = iconArt(kind ? `rune_bottle:${kind}` : 'rune_bottle');
+      runeSlot.button.classList.toggle('empty', !kind);
+      runeSlot.button.classList.toggle('charged', Boolean(kind));
+      runeSlot.button.style.setProperty('--rune', kind ? RUNE_CSS[kind] : '');
+      runeSlot.button.title = kind ? `${runeSlot.def.name} [${runeSlot.def.key}] · holds ${RUNES[kind].name}\n${RUNES[kind].description}` : runeSlot.title;
+    }
+    // Relics wear a price tag until bought; the tag lights up once the gold is there.
+    for (const slot of relicSlots) {
+      const locked = !view.hero.owned?.[slot.def.key];
+      const affordable = locked && view.hero.gold >= slot.def.cost;
+      if (locked !== slot.locked) {
+        const bought = slot.locked === true && !locked;
+        slot.locked = locked;
+        slot.button.classList.toggle('locked', locked);
+        slot.button.classList.toggle('active', !locked && Boolean(slot.def.passive));
+        if (bought) replay(slot.button, 'ready');
+      }
+      if (affordable !== slot.affordable) {
+        slot.affordable = affordable;
+        slot.button.classList.toggle('affordable', affordable);
+      }
+    }
+    // Rune effects still running, each with its seconds left.
+    let buffs = '';
+    for (const kind in view.hero.buffs) {
+      const seconds = Math.ceil((view.hero.buffs[kind] - view.hero.buffAge) / 1000);
+      if (seconds > 0) buffs += `${kind}:${seconds} `;
+    }
+    if (buffs !== last.buffs) {
+      last.buffs = buffs;
+      els.buffs.replaceChildren(
+        ...buffs
+          .trim()
+          .split(' ')
+          .filter(Boolean)
+          .map((entry) => {
+            const [kind, seconds] = entry.split(':');
+            const chip = el('span', 'buff', `${RUNES[kind].name} ${seconds}s`);
+            chip.style.setProperty('--rune', RUNE_CSS[kind]);
+            chip.title = RUNES[kind].description;
+            return chip;
+          }),
+      );
     }
     const respawn = Math.ceil(view.hero.respawnMs / 1000);
     if (respawn !== last.respawn) {
@@ -490,6 +574,7 @@ export function createHud() {
     }
 
     drawMinimap(view, now);
+    drawFloats(now);
   }
 
   /* ---------------------------------------------------------------- Public API */
@@ -508,9 +593,16 @@ export function createHud() {
       for (const name of SIDES) {
         teams[name].name.textContent = players[name].nickname;
         teams[name].root.classList.toggle('you', name === side);
-        heroBars[name].name.textContent = players[name].nickname;
+        // A bot's hero goes by its own name: the enemy on the field is Morgath, not a nickname.
+        heroBars[name].name.textContent = players[name].isBot ? HEROES[name].name : players[name].nickname;
         heroBars[name].root.classList.toggle('you', name === side);
       }
+      els.portrait.src = portraitArt(HEROES[side].id);
+      els.portrait.alt = HEROES[side].name;
+      els.heroName.textContent = HEROES[side].name;
+      els.heroPanel.dataset.side = side;
+      els.buffs.replaceChildren();
+      for (const item of floats.splice(0)) item.node.remove();
       els.playerName.textContent = players[side].nickname;
       els.feed.replaceChildren();
       els.hint.classList.remove('show');
@@ -519,9 +611,10 @@ export function createHud() {
       for (const bar of worldBars) bar.root.classList.remove('dead', 'hit');
       for (const slot of slots.values()) {
         slot.cooling = slot.lowMana = false;
+        slot.locked = slot.affordable = null;
         slot.shown = '';
         slot.cdText.textContent = '';
-        slot.button.classList.remove('cooling', 'low-mana', 'ready', 'deny');
+        slot.button.classList.remove('cooling', 'low-mana', 'ready', 'deny', 'locked', 'affordable', 'active');
       }
       for (const cardView of hand) cardView.lack = -1;
       pings.length = 0;
@@ -530,6 +623,7 @@ export function createHud() {
 
     /** Positions the floating bars and resizes the minimap. `project` maps world to CSS pixels. */
     layout(project, pixelsPerUnit) {
+      projectWorld = project;
       for (const bar of worldBars) bar.root.style.width = `${(bar.units * pixelsPerUnit).toFixed(1)}px`;
       for (const bar of structureBars) {
         const point = project(bar.x, bar.y, bar.z);
@@ -564,6 +658,15 @@ export function createHud() {
         item.classList.add('leaving');
         setTimeout(() => item.remove(), 400);
       }, FEED_LIFETIME_MS);
+    },
+
+    /** Text that pops out of a world point and floats up, such as the gold for a kill. */
+    floatText(text, x, y, z, tone = 'bounty') {
+      if (floats.length >= FLOAT_LIMIT) floats.shift().node.remove();
+      const node = el('span', `float-text ${tone}`, text);
+      node.style.opacity = '0';
+      els.world.append(node);
+      floats.push({ node, x, y, z, at: performance.now() });
     },
 
     /** Brief message near the bottom centre, for rejected actions. */

@@ -44,7 +44,7 @@ export const MATCH = {
   elixirStart: 5,
   elixirIntervalMs: 2_500,
   runeFirstSpawnMs: 30_000,
-  runeIntervalMs: 45_000,
+  runeIntervalMs: 60_000,
   waveFirstMs: 1_500,
   waveIntervalMs: 20_000,
   heroRespawnMs: 8_000,
@@ -52,12 +52,18 @@ export const MATCH = {
   unitCap: 44,
 };
 
+/** Each side fields its own champion. They share one kit (`HERO`) so a duel is always even. */
+export const HEROES = {
+  radiant: { id: 'aether_knight', name: 'Aether Knight', title: 'Rift-forged Vanguard' },
+  dire: { id: 'morgath', name: 'Morgath', title: 'Ember Tyrant' },
+};
+
 export const HERO = {
   id: 'aether_knight',
   name: 'Aether Knight',
   role: 'Melee Vanguard',
   description:
-    'A rift-forged champion who leads every charge. Move and attack with the mouse, then turn the fight with four abilities.',
+    'A rift-forged champion who leads every charge. Right-click to move and attack, turn the fight with four abilities, and spend gold on relics.',
   maxHp: 1200,
   maxMana: 400,
   hpRegen: 3,
@@ -78,7 +84,7 @@ export const HERO = {
       range: 6,
       width: 1.6,
       damage: 130,
-      description: 'Dash towards the cursor and slash every enemy in the path.',
+      description: 'Dash towards the cursor, leaving an afterimage and slashing every enemy in the path.',
     },
     {
       key: 'W',
@@ -88,7 +94,7 @@ export const HERO = {
       cooldownMs: 14_000,
       shield: 350,
       durationMs: 5_000,
-      description: 'Raise a barrier that absorbs 350 damage for 5 seconds.',
+      description: 'Surround the hero with a sphere of golden energy that absorbs 350 damage for 5 seconds.',
     },
     {
       key: 'E',
@@ -99,8 +105,8 @@ export const HERO = {
       range: 8,
       radius: 2.6,
       damage: 170,
-      stunMs: 1_300,
-      description: 'Call down lightning at the cursor that damages and stuns in an area.',
+      stunMs: 1_500,
+      description: 'Call down a lightning bolt at the cursor that damages enemies in the area and stuns them for 1.5 seconds.',
     },
     {
       key: 'R',
@@ -110,10 +116,13 @@ export const HERO = {
       cooldownMs: 60_000,
       range: 10,
       radius: 4.2,
+      /** Total damage, dealt in equal ticks over `durationMs` once the pillar lands. */
       damage: 420,
-      delayMs: 700,
+      delayMs: 400,
+      durationMs: 3_000,
+      tickMs: 500,
       ultimate: true,
-      description: 'Ultimate. A pillar of holy light devastates a large area at the cursor.',
+      description: 'Ultimate. A pillar of golden light descends at the cursor and burns every enemy inside it for 3 seconds.',
     },
   ],
   items: [
@@ -121,29 +130,42 @@ export const HERO = {
       key: 'Z',
       id: 'blink_boots',
       name: 'Blink Boots',
+      cost: 500,
       cooldownMs: 12_000,
       range: 7,
-      description: 'Teleport a short distance towards the cursor.',
+      description: 'Costs 500 gold to unlock. Then: teleport instantly towards the cursor.',
     },
     {
       key: 'X',
       id: 'lifesteal_blade',
       name: 'Lifesteal Blade',
+      cost: 750,
       passive: true,
-      lifesteal: 0.18,
-      description: 'Passive. Hero attacks restore 18% of the damage dealt as health.',
+      lifesteal: 0.4,
+      description: 'Costs 750 gold to unlock. Then: a crimson aura heals the hero for 40% of the damage it deals.',
     },
     {
       key: 'C',
-      id: 'power_rune',
-      name: 'Power Rune Slot',
+      id: 'rune_bottle',
+      name: 'River Rune Bottle',
       holdsRune: true,
-      durationMs: 12_000,
-      damageMultiplier: 2,
-      description: 'Walk onto the River pad to take a Power Rune, then press C for double damage for 12 seconds.',
+      description: 'Walk onto the River pad to bottle its rune, then press C to drink it: Double Damage, Haste or Arcane Regen.',
     },
   ],
 };
+
+/**
+ * River Runes. One of these appears on the centre pad at a time; a hero who
+ * walks over it bottles it and may drink it later.
+ */
+export const RUNES = {
+  damage: { name: 'Double Damage', durationMs: 12_000, damageMultiplier: 2, description: 'Double damage for 12 seconds.' },
+  haste: { name: 'Haste', durationMs: 12_000, speedMultiplier: 1.6, description: '60% faster movement for 12 seconds.' },
+  regen: { name: 'Arcane Regen', durationMs: 8_000, hpPerSecond: 60, manaPerSecond: 30, description: 'Rapidly restores health and mana for 8 seconds.' },
+};
+
+/** Fixed order, so a rune kind can be drawn by index. */
+export const RUNE_KINDS = Object.keys(RUNES);
 
 /** Share of ability damage that structures take. */
 export const ABILITY_STRUCTURE_FACTOR = 0.4;
@@ -154,11 +176,12 @@ export const ABILITY_STRUCTURE_FACTOR = 0.4;
  * `shot` units fire a projectile, `beam` units hit instantly, the rest swing in melee.
  * `siege` is the share of their damage that Towers and Thrones take.
  * `height` and `scale` only matter to the renderer: how tall the unit stands and how large its model is drawn.
+ * `bounty` is the gold a hero earns for landing the killing blow (Towers and heroes pay it whoever does).
  */
 export const UNITS = {
   hero: { name: HERO.name, hp: HERO.maxHp, damage: 62, siege: 0.3, range: 1.5, attackMs: 850, speed: 5.4, radius: 0.6, aggro: 4.5, bounty: 150, height: 2.3 },
-  melee: { name: 'Melee Creep', hp: 300, damage: 21, siege: 0.3, range: 1.1, attackMs: 1_000, speed: 3.3, radius: 0.42, aggro: 5.5, bounty: 14, height: 1.7, scale: 1.4 },
-  ranged: { name: 'Ranged Creep', hp: 190, damage: 30, siege: 0.3, range: 5.2, attackMs: 1_300, speed: 3.3, radius: 0.4, aggro: 6.5, bounty: 16, height: 1.8, scale: 1.4, shot: 'bolt', shotSpeed: 15 },
+  melee: { name: 'Melee Creep', hp: 300, damage: 21, siege: 0.3, range: 1.1, attackMs: 1_000, speed: 3.3, radius: 0.42, aggro: 5.5, bounty: 25, height: 1.7, scale: 1.4 },
+  ranged: { name: 'Ranged Creep', hp: 190, damage: 30, siege: 0.3, range: 5.2, attackMs: 1_300, speed: 3.3, radius: 0.4, aggro: 6.5, bounty: 25, height: 1.8, scale: 1.4, shot: 'bolt', shotSpeed: 15 },
   footman: { name: 'Footman', hp: 460, damage: 40, siege: 0.3, range: 1.2, attackMs: 1_000, speed: 3.5, radius: 0.46, aggro: 5.5, bounty: 12, height: 2.3, scale: 1.45 },
   archer: { name: 'Arcane Archer', hp: 250, damage: 58, siege: 0.3, range: 6.2, attackMs: 1_150, speed: 3.3, radius: 0.42, aggro: 7, bounty: 14, height: 2.3, scale: 1.45, shot: 'arcane', shotSpeed: 17 },
   golem: { name: 'Siege Golem', hp: 2200, damage: 110, siege: 1, range: 1.5, attackMs: 1_800, speed: 1.9, radius: 1.05, aggro: 9, bounty: 60, height: 3.6, scale: 2.5, buildingsOnly: true, slam: true },
@@ -169,7 +192,7 @@ export const UNITS = {
 export const UNIT_TYPES = Object.keys(UNITS);
 
 /** Bit flags in a unit's snapshot entry. */
-export const FLAG = { slowed: 1, stunned: 2, shielded: 4, dead: 8, empowered: 16 };
+export const FLAG = { slowed: 1, stunned: 2, shielded: 4, dead: 8, empowered: 16, hasted: 32, regen: 64, lifesteal: 128 };
 
 /**
  * `zone` is where a card may be played: 'own' is the player's bank of the River,

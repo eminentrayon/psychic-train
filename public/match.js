@@ -7,8 +7,10 @@
  * The server stays authoritative; local checks only give instant feedback.
  *
  * Controls
- *   Right-click (or left-click with no card armed)   move the hero, or attack the enemy under the cursor
- *   Q W E R, Z X C                                   abilities and items, aimed at the cursor
+ *   Right-click (or left-click with no card armed)   move the hero, or attack the enemy unit, hero or Tower under the cursor
+ *   Q W E R                                          abilities, aimed at the cursor
+ *   Z X                                              buy the relic (first press), then Z blinks to the cursor
+ *   C                                                drink the rune bottled on the River pad
  *   1 2 3 4 or click a card                          arm a card, then left-click the battlefield to play it
  *   Drag a card onto the battlefield or minimap      play it where it is dropped
  *   Esc or right-click                               put an armed card back
@@ -16,7 +18,7 @@
 
 import { createBattlefield } from './battlefield.js';
 import { createHud } from './hud.js';
-import { DECK, HERO, MATCH, STRUCTURES, UNIT_TYPES, canDeploy } from './shared.js';
+import { DECK, HERO, HEROES, MATCH, RUNES, STRUCTURES, UNIT_TYPES, canDeploy } from './shared.js';
 
 const CARDS = new Map(DECK.map((card) => [card.id, card]));
 const ABILITIES = new Map(HERO.abilities.map((ability) => [ability.key, ability]));
@@ -51,6 +53,8 @@ export function createMatchView({ socket, onExit }) {
   let pointer = null;
   let foeHp = HERO.maxHp;
   let leaveTimer = 0;
+  /** Where the hero was last told to walk, marked on the ground until it gets there. */
+  let waypoint = null;
   const noticedAt = new Map();
 
   /* ---------------------------------------------------------------- Live values */
@@ -60,6 +64,14 @@ export function createMatchView({ socket, onExit }) {
   const cooldownNow = (key) => Math.max(0, (snapshot.you.cooldowns[key] ?? 0) - age());
   const armedCard = () => (armed === null ? null : CARDS.get(snapshot.you.hand[armed]));
   const ownerOf = (def) => (def.side === side ? 'Your' : 'Enemy');
+  const heroName = (name) => HEROES[name].name;
+  /** "a Haste rune", "an Arcane Regen rune". */
+  const aRune = (kind) => `${/^[aeiou]/i.test(RUNES[kind].name) ? 'an' : 'a'} ${RUNES[kind].name} rune`;
+
+  function setWaypoint(point) {
+    waypoint = point;
+    field.setWaypoint(point);
+  }
 
   const view = { hp: [], hand: [], hero: {}, cooldowns: {}, units: [] };
 
@@ -69,7 +81,7 @@ export function createMatchView({ socket, onExit }) {
     const elapsed = finished ? 0 : Math.max(0, now - snapshotAt);
     const { hero } = snapshot.you;
     view.timeLeftMs = Math.max(0, snapshot.timeLeftMs - elapsed);
-    view.runeActive = snapshot.rune.active;
+    view.rune = snapshot.rune.kind;
     view.runeInMs = Math.max(0, snapshot.rune.nextInMs - elapsed);
     view.units = snapshot.units;
     view.elixir = Math.min(MATCH.elixirMax, snapshot.you.elixir + elapsed / MATCH.elixirIntervalMs);
@@ -81,6 +93,9 @@ export function createMatchView({ socket, onExit }) {
     view.hero.level = hero.level;
     view.hero.gold = hero.gold;
     view.hero.rune = hero.rune;
+    view.hero.owned = hero.owned;
+    view.hero.buffs = hero.buffs;
+    view.hero.buffAge = elapsed;
     view.hero.respawnMs = Math.max(0, hero.respawnMs - elapsed);
     view.foeHp = foeHp;
     for (const key in snapshot.you.cooldowns) view.cooldowns[key] = Math.max(0, snapshot.you.cooldowns[key] - elapsed);
@@ -90,8 +105,10 @@ export function createMatchView({ socket, onExit }) {
     for (const name of ['radiant', 'dire']) {
       const at = field.heroView(name);
       if (!at) continue;
-      const screen = field.project(at.x, at.y + 3.45, at.z);
+      const screen = field.project(at.x, at.y + 3.7, at.z);
       hud.placeHero(name, screen.x, screen.y, !at.dead);
+      // The walk marker goes once the hero arrives, or falls on the way.
+      if (name === side && waypoint && (at.dead || Math.hypot(at.x - waypoint.x, at.z - waypoint.z) < 0.5)) setWaypoint(null);
     }
   };
 
@@ -99,7 +116,7 @@ export function createMatchView({ socket, onExit }) {
     const previous = snapshot;
     snapshot = next;
     snapshotAt = performance.now();
-    field.setRune(next.rune.active);
+    field.setRune(next.rune.kind);
     field.sync(next);
     for (const unit of next.units) {
       if (unit[1] === HERO_TYPE && unit[0] !== next.you.hero.id) foeHp = unit[5];
@@ -204,6 +221,7 @@ export function createMatchView({ socket, onExit }) {
     if (target) socket.emit('game:attack', { id: target });
     else socket.emit('game:move', { x: point.x, z: point.z });
     field.fx.marker(point.x, point.z, Boolean(target));
+    setWaypoint(target ? null : { x: point.x, z: point.z });
   }
 
   function cast(key) {
@@ -227,13 +245,23 @@ export function createMatchView({ socket, onExit }) {
   function useItem(key) {
     if (finished) return;
     const item = ITEMS.get(key);
-    if (item.passive) {
-      hud.hint(`${item.name} is passive`);
-    } else if (snapshot.you.hero.respawnMs > 0) {
+    const { hero } = snapshot.you;
+    if (item.cost && !hero.owned[key]) {
+      // The first press buys the relic.
+      if (hero.gold < item.cost) {
+        hud.hint(`${item.name} costs ${item.cost} gold`);
+        hud.denySlot(key);
+      } else {
+        hud.pressSlot(key);
+        socket.emit('game:useItem', { key });
+      }
+    } else if (item.passive) {
+      hud.hint(`${item.name} is always active`);
+    } else if (hero.respawnMs > 0) {
       hud.hint('Your hero is respawning');
       hud.denySlot(key);
-    } else if (item.holdsRune && !snapshot.you.hero.rune) {
-      hud.hint('No Power Rune stored');
+    } else if (item.holdsRune && !hero.rune) {
+      hud.hint('The Rune Bottle is empty. Walk onto the River pad when a rune appears');
       hud.denySlot(key);
     } else if (cooldownNow(key) > 0) {
       hud.hint(`${item.name} is on cooldown`);
@@ -380,25 +408,50 @@ export function createMatchView({ socket, onExit }) {
         const ability = ABILITIES.get(event.key);
         if (!ability) break;
         field.fx.cast(event, ability);
-        if (!mine && ability.ultimate) hud.feed(`Enemy unleashed ${ability.name}!`, 'danger');
+        if (!mine && ability.ultimate) hud.feed(`${heroName(event.side)} unleashed ${ability.name}!`, 'danger');
         break;
       }
-      case 'item':
-        field.fx.item(event);
+      case 'item': {
+        const item = ITEMS.get(event.key);
+        if (!item) break;
+        // A relic bought while respawning has no hero to light up.
+        if (!event.bought || !field.heroView(event.side)?.dead) field.fx.item(event);
+        if (event.bought) {
+          hud.feed(mine ? `${item.name} unlocked!` : `${heroName(event.side)} bought ${item.name}`, mine ? 'gold' : 'danger');
+        } else if (event.rune) {
+          const rune = RUNES[event.rune];
+          hud.feed(mine ? `${rune.name}! ${rune.description}` : `${heroName(event.side)} drank ${aRune(event.rune)}!`, mine ? 'gold' : 'danger');
+        }
         break;
+      }
       case 'rune':
-        field.fx.rune();
-        field.setRune(true);
-        hud.feed('Power Rune spawned!', 'gold');
+        if (!RUNES[event.kind]) break;
+        field.fx.rune(event.kind);
+        field.setRune(event.kind);
+        hud.feed(`${aRune(event.kind).replace(/^a/, 'A')} has appeared on the River!`, 'gold');
         break;
       case 'runeTaken':
-        field.fx.runeTaken();
-        field.setRune(false);
-        hud.feed(mine ? 'You took the Power Rune! Press C to unleash it.' : 'The enemy hero took the Power Rune!', mine ? 'gold' : 'danger');
+        if (!RUNES[event.kind]) break;
+        field.fx.runeTaken(event.kind);
+        field.setRune(null);
+        hud.feed(
+          mine ? `${RUNES[event.kind].name} bottled! Press C to drink it.` : `${heroName(event.side)} bottled the ${RUNES[event.kind].name} rune!`,
+          mine ? 'gold' : 'danger',
+        );
         break;
+      case 'bounty': {
+        // Gold for a kill: coins burst where it fell and the amount floats up from it.
+        const height = event.id < 0 ? STRUCTURES[-event.id - 1].height * 0.7 : 1.9;
+        field.fx.gold(event.x, height, event.z);
+        hud.floatText(`+${event.gold}g`, event.x, height + 0.5, event.z);
+        break;
+      }
       case 'heroDown': {
         const seconds = Math.round(event.respawnMs / 1000);
-        hud.feed(mine ? `Your hero has fallen! Respawning in ${seconds}s.` : 'Enemy hero slain!', mine ? 'danger' : 'good');
+        hud.feed(
+          mine ? `${heroName(side)} has fallen! Respawning in ${seconds}s.` : `${heroName(event.side)} has been slain!`,
+          mine ? 'danger' : 'good',
+        );
         break;
       }
       case 'reject':
@@ -437,6 +490,7 @@ export function createMatchView({ socket, onExit }) {
       snapshot = null;
       armed = null;
       drag = null;
+      waypoint = null;
       foeHp = HERO.maxHp;
       noticedAt.clear();
       resetLeaveButton();
@@ -453,8 +507,8 @@ export function createMatchView({ socket, onExit }) {
       window.addEventListener('pointermove', onPointerMove);
       // Web fonts can change the HUD's size after the first layout.
       document.fonts?.ready.then(layout);
-      hud.feed('The battle begins!', 'gold');
-      hud.feed('Right-click to move your hero. Keys 1-4 arm a card.', 'info');
+      hud.feed(`The battle begins! You command ${heroName(side)}.`, 'gold');
+      hud.feed('Right-click to move and attack. Q W E R cast, Z X buy relics, 1-4 arm a card.', 'info');
     },
 
     stop() {
@@ -469,5 +523,10 @@ export function createMatchView({ socket, onExit }) {
 
     /** Renderer counters, for diagnostics from the browser console. */
     stats: () => field.stats(),
+    /** More console diagnostics: world-to-screen projection, a switch that pins render quality, and the effect table. */
+    project: (x, y, z) => field.project(x, y, z),
+    lockQuality: (locked) => field.lockQuality(locked),
+    fx: field.fx,
+    heroView: (name) => field.heroView(name),
   };
 }
