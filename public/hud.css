@@ -1,0 +1,1131 @@
+/* ==========================================================================
+   RuneDeck — in-game HUD
+   Everything is sized in em from one viewport-driven font size, so the whole
+   HUD scales together. 1em = 16px at 1440 x 900.
+   ========================================================================== */
+
+.game {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  overflow: hidden;
+  background: var(--bg-0);
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  animation: fade-in 0.6s ease both;
+}
+
+body[data-phase='game'] .app,
+body[data-phase='game'] #backdrop {
+  display: none;
+}
+
+.battlefield {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+}
+
+.game.arming .battlefield,
+.game.arming .minimap canvas {
+  cursor: crosshair;
+}
+
+.world-layer,
+.hud {
+  position: absolute;
+  inset: 0;
+  font-size: clamp(10px, min(1.111vw, 1.778vh), 26px);
+  pointer-events: none;
+}
+
+.world-layer {
+  overflow: hidden;
+}
+
+.hud > * {
+  pointer-events: auto;
+}
+
+/* Blurring a canvas that repaints every frame is costly, so HUD panels are near-opaque instead. */
+.hud .glass {
+  border-radius: 0.85em;
+  background: linear-gradient(180deg, rgba(21, 29, 56, 0.94), rgba(7, 10, 22, 0.96));
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow:
+    0 0.6em 1.8em rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.hud kbd {
+  font-family: var(--font-ui);
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* ---------------------------------------------------------------- Health bars in the world */
+
+.wbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 0.5em;
+  margin-top: -0.25em;
+  border-radius: 0.2em;
+  background: rgba(4, 6, 12, 0.88);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.85),
+    0 0.1em 0.4em rgba(0, 0, 0, 0.6);
+  transition: opacity 0.6s ease 0.9s;
+}
+
+.wbar.throne {
+  height: 0.72em;
+  margin-top: -0.36em;
+}
+
+.wbar.hero {
+  height: 0.42em;
+}
+
+.wbar i {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  transform-origin: left center;
+}
+
+/* The pale ghost lags behind the fill, so lost health visibly drains away. */
+.wb-ghost,
+.bar-ghost,
+.stat-ghost {
+  background: #fff2c2;
+  transition: transform 0.9s cubic-bezier(0.3, 0, 0.2, 1) 0.3s;
+}
+
+.wb-fill,
+.bar-fill,
+.stat-fill {
+  transition: transform 0.14s ease-out;
+}
+
+.wbar.radiant .wb-fill {
+  background: linear-gradient(180deg, #b4f3ff, #2f9cf0);
+}
+
+.wbar.dire .wb-fill {
+  background: linear-gradient(180deg, #ffb9a4, #e8362f);
+}
+
+.wbar.hit {
+  animation: bar-hit 0.3s ease-out;
+}
+
+.wbar.dead {
+  opacity: 0;
+}
+
+.wb-name {
+  position: absolute;
+  bottom: 150%;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  color: #e9eefb;
+  text-shadow:
+    0 1px 3px #000,
+    0 0 6px #000;
+}
+
+.wbar.you .wb-name {
+  color: var(--gold-1);
+}
+
+/* ---------------------------------------------------------------- Top bar */
+
+.hud-top {
+  position: absolute;
+  top: 0.6em;
+  left: 50%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 1em;
+  width: min(52em, calc(100% - 1.2em));
+  padding: 0.5em 0.9em;
+  transform: translateX(-50%);
+}
+
+.team {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  min-width: 0;
+}
+
+.team.dire {
+  flex-direction: row-reverse;
+}
+
+.team-crest {
+  width: 2.5em;
+  height: 2.5em;
+  flex: none;
+}
+
+.team-crest img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.team.radiant .team-crest {
+  filter: drop-shadow(0 0 0.5em rgba(47, 211, 245, 0.8));
+}
+
+.team.dire .team-crest {
+  filter: drop-shadow(0 0 0.5em rgba(240, 65, 58, 0.8));
+}
+
+.team-body {
+  display: grid;
+  flex: 1;
+  gap: 0.28em;
+  min-width: 0;
+}
+
+.team-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.6em;
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  line-height: 1.1;
+  text-transform: uppercase;
+}
+
+.team.dire .team-head {
+  flex-direction: row-reverse;
+}
+
+.team.radiant .team-name {
+  color: var(--cyan-1);
+}
+
+.team.dire .team-name {
+  color: var(--crimson-1);
+}
+
+.team-player {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+.team.you .team-player {
+  color: var(--gold-1);
+}
+
+.team-bar,
+.stat {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 0.3em;
+  background: #060a16;
+}
+
+.team-bar {
+  height: 1.1em;
+}
+
+.team-bar i,
+.stat i {
+  position: absolute;
+  inset: 0;
+  transform-origin: left center;
+}
+
+/* Dire's bar mirrors Radiant's: both drain towards the outer edge of the screen. */
+.team.dire .team-bar i {
+  transform-origin: right center;
+}
+
+.team.radiant .bar-fill {
+  background: linear-gradient(180deg, #8fe8ff, #2a8fe8 55%, #1a5fb8);
+}
+
+.team.dire .bar-fill {
+  background: linear-gradient(180deg, #ffa58a, #e8362f 55%, #a81a20);
+}
+
+.bar-text,
+.stat b {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 0.74em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.06em;
+  color: #fff;
+  text-shadow: 0 1px 2px #000;
+}
+
+.clock {
+  display: grid;
+  justify-items: center;
+  gap: 0.15em;
+  padding: 0 0.5em;
+}
+
+.clock-time {
+  font-size: 1.95em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 0 0 0.6em rgba(120, 220, 255, 0.5);
+}
+
+.clock-time.urgent {
+  color: var(--crimson-1);
+  text-shadow: 0 0 0.6em rgba(240, 65, 58, 0.8);
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+
+.clock-rune {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  font-size: 0.72em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+.rune-gem {
+  width: 0.8em;
+  height: 0.8em;
+  border: 1px solid var(--gold-2);
+  transform: rotate(45deg);
+}
+
+.clock-rune.up {
+  color: var(--gold-1);
+}
+
+.clock-rune.up .rune-gem {
+  background: linear-gradient(135deg, #fff1b8, #e3a12a);
+  box-shadow: 0 0 0.7em rgba(255, 200, 90, 0.95);
+}
+
+.hud-leave {
+  position: absolute;
+  top: 0.9em;
+  right: 0.9em;
+  padding: 0.55em 0.9em;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 0.5em;
+  background: rgba(8, 12, 26, 0.85);
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+.hud-leave:hover,
+.hud-leave:focus-visible {
+  border-color: var(--cyan-2);
+  color: var(--cyan-1);
+  outline: none;
+}
+
+.hud-leave.confirm {
+  border-color: var(--crimson-2);
+  background: rgba(138, 20, 32, 0.85);
+  color: #fff;
+}
+
+/* ---------------------------------------------------------------- Combat feed */
+
+.feed {
+  position: absolute;
+  bottom: 12em;
+  left: 0.8em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3em;
+  width: 21em;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  pointer-events: none;
+}
+
+.feed-item {
+  --tone: var(--cyan-2);
+  padding: 0.38em 0.8em 0.32em;
+  border-left: 0.22em solid var(--tone);
+  background: linear-gradient(90deg, rgba(5, 8, 18, 0.9), rgba(5, 8, 18, 0.55) 70%, rgba(5, 8, 18, 0));
+  font-size: 0.9em;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-shadow: 0 1px 2px #000;
+  animation: feed-in 0.25s var(--ease-out) both;
+  transition: opacity 0.4s ease;
+}
+
+.feed-item.danger {
+  --tone: var(--crimson-2);
+  color: #ffd2cc;
+}
+
+.feed-item.gold {
+  --tone: var(--gold-2);
+  color: var(--gold-1);
+}
+
+.feed-item.good {
+  --tone: #4dffa0;
+  color: #d5ffe6;
+}
+
+.feed-item.leaving {
+  opacity: 0;
+}
+
+/* ---------------------------------------------------------------- Hero panel */
+
+.hero-panel {
+  position: absolute;
+  bottom: 0.8em;
+  left: 0.8em;
+  display: flex;
+  gap: 0.9em;
+  padding: 0.8em 0.9em;
+}
+
+.hero-id {
+  display: grid;
+  align-content: start;
+  justify-items: center;
+  gap: 0.5em;
+}
+
+.portrait {
+  position: relative;
+  width: 5.5em;
+  height: 5.5em;
+  padding: 0.2em;
+  border-radius: 50%;
+  background: conic-gradient(from 210deg, #7a5415, #fbe9ae, #b98a2c, #fff5cf, #7a5415, #e7c263, #7a5415);
+  box-shadow: 0 0 1em rgba(227, 183, 85, 0.35);
+}
+
+.portrait img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 35%, #223a70, #0a1024 75%);
+}
+
+.level {
+  position: absolute;
+  right: -0.3em;
+  bottom: -0.2em;
+  display: grid;
+  place-items: center;
+  width: 1.9em;
+  height: 1.9em;
+  border: 0.12em solid var(--gold-2);
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #2c3d6e, #0a1024);
+  font-size: 0.95em;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--gold-1);
+}
+
+.gold {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.14em 0.7em 0.1em 0.35em;
+  border: 1px solid rgba(227, 183, 85, 0.45);
+  border-radius: 999px;
+  background: #0a0f1f;
+  font-size: 0.92em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--gold-1);
+}
+
+.coin {
+  width: 1em;
+  height: 1em;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #fff5cf, #e3b755 55%, #8a6220);
+  box-shadow: inset 0 0 0 0.08em rgba(122, 84, 21, 0.8);
+}
+
+.hero-main {
+  display: grid;
+  align-content: start;
+  gap: 0.32em;
+}
+
+.hero-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.8em;
+  line-height: 1.15;
+}
+
+.hero-title strong {
+  font-family: var(--font-display);
+  font-size: 1.02em;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.hero-title span {
+  overflow: hidden;
+  max-width: 12em;
+  font-size: 0.75em;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+.stat {
+  height: 1.25em;
+}
+
+.stat.hp .stat-fill {
+  background: linear-gradient(180deg, #a6ffa2, #2fc85a 50%, #168a3a);
+}
+
+.stat.mana .stat-fill {
+  background: linear-gradient(180deg, #a6dcff, #2f86f0 50%, #1a4fb8);
+}
+
+.skills {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.9em;
+  margin-top: 0.3em;
+}
+
+.abilities,
+.items {
+  display: flex;
+  gap: 0.4em;
+}
+
+.items {
+  padding-left: 0.9em;
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.skill {
+  position: relative;
+  overflow: hidden;
+  width: 3.6em;
+  height: 3.6em;
+  padding: 0;
+  border: 0.1em solid rgba(227, 183, 85, 0.75);
+  border-radius: 0.5em;
+  background: #0a0f22;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.skill.item {
+  width: 2.8em;
+  height: 2.8em;
+  border-color: rgba(184, 246, 255, 0.5);
+}
+
+.skill.ultimate {
+  border-color: var(--gold-1);
+  box-shadow: 0 0 0.8em rgba(255, 214, 120, 0.45);
+}
+
+.skill:hover,
+.skill:focus-visible {
+  border-color: #fff;
+  box-shadow: 0 0 0.9em rgba(184, 246, 255, 0.5);
+  outline: none;
+}
+
+.skill img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  transition: filter 0.2s ease;
+}
+
+.skill.cooling img,
+.skill.empty img {
+  filter: saturate(0.35) brightness(0.7);
+}
+
+.skill.low-mana img {
+  filter: saturate(0.5) brightness(0.5) hue-rotate(200deg);
+}
+
+.skill kbd {
+  position: absolute;
+  top: 0.15em;
+  left: 0.3em;
+  font-size: 0.72em;
+  color: #fff;
+  text-shadow:
+    0 1px 2px #000,
+    0 0 4px #000;
+}
+
+.skill-cost {
+  position: absolute;
+  right: 0.3em;
+  bottom: 0.1em;
+  font-size: 0.66em;
+  font-weight: 700;
+  color: #a6dcff;
+  text-shadow:
+    0 1px 2px #000,
+    0 0 4px #000;
+}
+
+/* Clock-wipe: the shaded wedge shrinks as the cooldown runs out. */
+.skill-cd {
+  position: absolute;
+  inset: 0;
+  display: none;
+  background: conic-gradient(transparent calc((1 - var(--p, 0)) * 1turn), rgba(3, 5, 12, 0.78) 0);
+}
+
+.skill.cooling .skill-cd {
+  display: block;
+}
+
+.skill-cd-text {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 1.3em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  text-shadow:
+    0 1px 3px #000,
+    0 0 6px #000;
+  pointer-events: none;
+}
+
+.skill.item .skill-cd-text {
+  font-size: 1.05em;
+}
+
+.skill.ready {
+  animation: skill-ready 0.5s ease-out;
+}
+
+.skill.pressed {
+  animation: skill-press 0.2s ease-out;
+}
+
+.skill.deny,
+.hand-card.deny {
+  animation: deny 0.28s ease-out;
+}
+
+/* ---------------------------------------------------------------- Right column: minimap and card dock */
+
+.hud-right {
+  position: absolute;
+  right: 0.8em;
+  bottom: 0.8em;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.6em;
+  pointer-events: none;
+}
+
+.hud-right > * {
+  pointer-events: auto;
+}
+
+.minimap {
+  padding: 0.35em;
+}
+
+.minimap canvas {
+  display: block;
+  width: 15em;
+  height: 8.35em;
+  border-radius: 0.55em;
+  cursor: pointer;
+}
+
+/* Padding leaves room for the cost badges and the selection glow, so nothing crosses the frame. */
+.dock {
+  padding: 1.5em 1em 0.8em 1.5em;
+}
+
+.dock-cards {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.9em;
+}
+
+.hand {
+  display: flex;
+  gap: 0.55em;
+}
+
+.hand-card {
+  --frame: var(--gold-2);
+  --frame-glow: rgba(227, 183, 85, 0.65);
+  --tint: rgba(227, 183, 85, 0.2);
+
+  position: relative;
+  display: block;
+  width: 5.2em;
+  height: 6.9em;
+  padding: 0;
+  flex: none;
+  border: 0.1em solid var(--frame);
+  border-radius: 0.6em;
+  background:
+    radial-gradient(120% 70% at 50% 30%, var(--tint), transparent 70%),
+    linear-gradient(180deg, #1d2950 0%, #0a0f22 100%);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.07),
+    0 0.35em 0.9em rgba(0, 0, 0, 0.5);
+  cursor: grab;
+  touch-action: none;
+  transition: transform 0.16s var(--ease-out), box-shadow 0.16s ease, filter 0.2s ease;
+}
+
+.hand-card.type-spell {
+  --frame: var(--crimson-2);
+  --frame-glow: rgba(240, 65, 58, 0.65);
+  --tint: rgba(240, 65, 58, 0.2);
+}
+
+.hand-card.type-building {
+  --frame: var(--cyan-2);
+  --frame-glow: rgba(47, 211, 245, 0.65);
+  --tint: rgba(47, 211, 245, 0.2);
+}
+
+/* Hover and selection keep the card in its place: a gold frame and a slight scale, never a shift. */
+.hand-card:hover,
+.hand-card:focus-visible {
+  transform: scale(1.03);
+  border-color: var(--gold-2);
+  outline: none;
+}
+
+.hand-card.armed {
+  z-index: 1;
+  border-color: var(--gold-1);
+  transform: scale(1.05);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 241, 184, 0.6),
+    0 0 0 0.13em rgba(227, 183, 85, 0.95),
+    0 0 1.2em rgba(255, 214, 120, 0.9);
+  animation: card-armed 1.1s ease-in-out infinite;
+}
+
+.hand-card.unaffordable {
+  filter: saturate(0.5);
+}
+
+.hand-card.drawn {
+  animation: card-drawn 0.32s var(--ease-out);
+}
+
+.hc-art {
+  position: absolute;
+  top: 0.85em;
+  left: 50%;
+  width: 3.7em;
+  height: 3.7em;
+  transform: translateX(-50%);
+  filter: drop-shadow(0 0.12em 0.2em rgba(0, 0, 0, 0.65));
+  pointer-events: none;
+}
+
+.hc-name {
+  position: absolute;
+  right: 0.2em;
+  bottom: 0.35em;
+  left: 0.2em;
+  display: grid;
+  place-items: center;
+  height: 2.2em;
+  font-size: 0.64em;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  line-height: 1.05;
+  text-align: center;
+  text-transform: uppercase;
+  color: #eef2ff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+}
+
+.hc-cost,
+.elixir-badge {
+  display: grid;
+  place-items: center;
+  border: 0.09em solid #f9dcff;
+  border-radius: 0.15em 50% 50% 50%;
+  transform: rotate(45deg);
+  background: radial-gradient(circle at 35% 35%, var(--elixir-1), var(--elixir-2) 48%, var(--elixir-3));
+  box-shadow:
+    0 0 0.6em rgba(201, 75, 240, 0.75),
+    0 0.12em 0.25em rgba(0, 0, 0, 0.6);
+}
+
+.hc-cost {
+  position: absolute;
+  top: -0.6em;
+  left: -0.6em;
+  z-index: 2;
+  width: 1.7em;
+  height: 1.7em;
+}
+
+.hc-cost b,
+.elixir-badge b {
+  transform: rotate(-45deg);
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(60, 0, 90, 0.95);
+}
+
+.hand-card kbd {
+  position: absolute;
+  top: 0.3em;
+  right: 0.35em;
+  display: grid;
+  place-items: center;
+  width: 1.45em;
+  height: 1.45em;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 0.3em;
+  background: rgba(5, 8, 18, 0.75);
+  font-size: 0.7em;
+  color: #fff;
+}
+
+/* Shade that drains away as Elixir builds towards the card's cost. */
+.hc-charge {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  background: rgba(4, 6, 14, 0.62);
+  transform: scaleY(var(--lack, 0));
+  transform-origin: top center;
+  pointer-events: none;
+}
+
+.next {
+  display: grid;
+  justify-items: center;
+  gap: 0.3em;
+}
+
+.next-label {
+  font-size: 0.66em;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* The mini card is the same component at a smaller font size. */
+.hand-card.mini {
+  font-size: 0.64em;
+  cursor: default;
+  filter: saturate(0.8) brightness(0.9);
+}
+
+.hand-card.mini:hover {
+  transform: none;
+}
+
+.elixir {
+  display: flex;
+  align-items: center;
+  gap: 0.9em;
+  margin-top: 0.75em;
+}
+
+.elixir-badge {
+  width: 1.9em;
+  height: 1.9em;
+  flex: none;
+}
+
+.elixir-badge b {
+  font-size: 1.05em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Ten separate segments. A full one burns bright magenta; the one being charged fills from the left. */
+.elixir-track {
+  display: flex;
+  flex: 1;
+  gap: 0.22em;
+  height: 1.35em;
+}
+
+.elixir-seg {
+  position: relative;
+  flex: 1;
+  overflow: hidden;
+  border: 1px solid rgba(249, 220, 255, 0.28);
+  border-radius: 0.28em;
+  background: #150b26;
+  box-shadow: inset 0 0.1em 0.3em rgba(0, 0, 0, 0.85);
+}
+
+.elixir-seg i {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  transform: scaleX(0);
+  transform-origin: left center;
+  background: linear-gradient(180deg, #d59bf2 0%, #a04fd6 50%, #6c27a6 100%);
+}
+
+.elixir-seg.full {
+  border-color: #ffe3ff;
+  box-shadow:
+    0 0 0.6em rgba(236, 92, 255, 0.95),
+    0 0 0.15em rgba(255, 255, 255, 0.9);
+  animation: elixir-lit 0.45s ease-out;
+}
+
+.elixir-seg.full i {
+  background: linear-gradient(180deg, #fff0ff 0%, #f67bff 38%, #cf3df0 100%);
+}
+
+/* At ten the whole bar shimmers brighter; it never dims. */
+.elixir-track.maxed .elixir-seg {
+  animation: elixir-maxed 1.3s ease-in-out infinite;
+}
+
+.card-ghost {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 60;
+  pointer-events: none;
+}
+
+/* Held above the pointer so the placement ring on the ground stays visible. */
+.card-ghost .hand-card {
+  margin: -8.2em 0 0 -2.6em;
+  opacity: 0.85;
+  transform: scale(0.85) rotate(-4deg);
+  box-shadow:
+    0 0.8em 1.6em rgba(0, 0, 0, 0.6),
+    0 0 1.5em var(--frame-glow);
+}
+
+/* ---------------------------------------------------------------- Hint and result */
+
+.hint {
+  position: absolute;
+  bottom: 2.4em;
+  left: 50%;
+  max-width: 24em;
+  padding: 0.45em 1.1em 0.4em;
+  border: 1px solid rgba(240, 65, 58, 0.55);
+  border-radius: 0.5em;
+  background: rgba(8, 10, 22, 0.92);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-align: center;
+  color: #ffd2cc;
+  opacity: 0;
+  transform: translate(-50%, 0.4em);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+}
+
+.hint.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.result {
+  position: absolute;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(ellipse at center, rgba(5, 7, 15, 0.55), rgba(5, 7, 15, 0.9));
+  animation: fade-in 0.5s ease both;
+}
+
+.result-card {
+  display: grid;
+  justify-items: center;
+  gap: 0.9em;
+  width: min(32em, calc(100% - 2em));
+  padding: 2.2em 2em 1.9em;
+  text-align: center;
+  animation: modal-in 0.5s var(--ease-out) both;
+}
+
+.result-title {
+  padding-left: 0.2em;
+  font-family: var(--font-display);
+  font-size: 3.4em;
+  font-weight: 900;
+  letter-spacing: 0.2em;
+  line-height: 1.1;
+  text-transform: uppercase;
+  color: var(--gold-1);
+  text-shadow: 0 0 0.6em rgba(240, 190, 90, 0.7);
+}
+
+.result[data-outcome='defeat'] .result-title {
+  color: var(--crimson-1);
+  text-shadow: 0 0 0.6em rgba(240, 65, 58, 0.8);
+}
+
+.result[data-outcome='draw'] .result-title {
+  color: var(--cyan-1);
+  text-shadow: 0 0 0.6em rgba(47, 211, 245, 0.7);
+}
+
+.result-detail {
+  font-size: 1.05em;
+  color: #d5dcf0;
+}
+
+.result .btn {
+  margin-top: 0.4em;
+  padding: 0.75em 1.4em;
+  font-size: 0.95em;
+}
+
+/* ---------------------------------------------------------------- Keyframes */
+
+@keyframes bar-hit {
+  from { filter: brightness(1.9); }
+}
+
+@keyframes feed-in {
+  from { opacity: 0; translate: -1.2em 0; }
+}
+
+@keyframes skill-ready {
+  from { box-shadow: 0 0 0 0.2em rgba(255, 255, 255, 0.9), 0 0 1.4em rgba(255, 240, 180, 0.95); filter: brightness(1.9); }
+}
+
+@keyframes skill-press {
+  from { scale: 0.88; filter: brightness(1.7); }
+}
+
+@keyframes deny {
+  20% { translate: -0.22em 0; }
+  40% { translate: 0.22em 0; }
+  60% { translate: -0.14em 0; }
+  80% { translate: 0.14em 0; }
+}
+
+@keyframes card-drawn {
+  from { opacity: 0; translate: 1.4em 0.6em; scale: 0.8; }
+}
+
+@keyframes card-armed {
+  50% { box-shadow: inset 0 0 0 1px rgba(255, 241, 184, 0.6), 0 0 0 0.13em rgba(255, 233, 160, 1), 0 0 1.9em rgba(255, 224, 138, 1); }
+}
+
+@keyframes elixir-lit {
+  from { filter: brightness(2.4); }
+}
+
+@keyframes elixir-maxed {
+  50% { filter: brightness(1.35); }
+}
+
+@keyframes rune-charged {
+  50% { box-shadow: 0 0 1.4em rgba(255, 214, 120, 1); }
+}
+
+/* ---------------------------------------------------------------- Hero states */
+
+.respawn {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  font-size: 2.3em;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  color: #fff;
+  text-shadow:
+    0 0 0.4em #000,
+    0 0.05em 0.1em #000;
+  pointer-events: none;
+}
+
+.hero-panel.dead .portrait img,
+.hero-panel.dead .skill img {
+  filter: grayscale(1) brightness(0.45);
+}
+
+/* A stored Power Rune lights its slot until it is used. */
+.skill.charged {
+  border-color: var(--gold-1);
+  box-shadow: 0 0 0.8em rgba(255, 200, 90, 0.85);
+  animation: rune-charged 1.2s ease-in-out infinite;
+}
+
+.skill.charged img {
+  filter: brightness(2.2) saturate(1.4) drop-shadow(0 0 0.25em rgba(255, 210, 110, 0.9));
+}

@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#05070f">
+  <meta name="description" content="RuneDeck — a real-time tactical lane battler. Command your Hero, deploy your deck, shatter the Ancient Throne.">
+  <title>RuneDeck — Tactical Lane Battler</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cpath d='M24 3 45 24 24 45 3 24Z' fill='%230a0f1f' stroke='%23e3b755' stroke-width='3'/%3E%3Cpath d='M24 9 9 24 24 39Z' fill='%2338c6f4'/%3E%3Cpath d='M24 9 39 24 24 39Z' fill='%23f0413a'/%3E%3Cpath d='M24 4v40' stroke='%23eaffff' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;900&family=Rajdhani:wght@500;600;700&display=swap">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="hud.css">
+  <script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+</head>
+<body data-phase="lobby">
+  <canvas id="backdrop" aria-hidden="true"></canvas>
+
+  <!-- ===================================================== Lobby -->
+  <div class="app" id="app">
+    <header class="topbar glass" aria-label="Loadout">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true">
+          <defs>
+            <linearGradient id="bm-gold" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#fff1b8"/><stop offset=".5" stop-color="#d4a441"/><stop offset="1" stop-color="#7a5415"/>
+            </linearGradient>
+            <linearGradient id="bm-radiant" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#c9f7ff"/><stop offset="1" stop-color="#1c6fc4"/>
+            </linearGradient>
+            <linearGradient id="bm-dire" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#ffb07a"/><stop offset="1" stop-color="#b3161c"/>
+            </linearGradient>
+          </defs>
+          <path d="M24 3 45 24 24 45 3 24Z" fill="#0a0f1f" stroke="url(#bm-gold)" stroke-width="2.6" stroke-linejoin="round"/>
+          <path d="M24 9 9 24 24 39Z" fill="url(#bm-radiant)"/>
+          <path d="M24 9 39 24 24 39Z" fill="url(#bm-dire)"/>
+          <path d="M24 4v40" stroke="#eaffff" stroke-width="1.6"/>
+        </svg>
+        <div class="brand-text">
+          <span class="brand-name">RuneDeck</span>
+          <span class="brand-sub">Lane Battler</span>
+        </div>
+      </div>
+
+      <div class="slot slot-nickname">
+        <label class="field-label" for="nickname">Player Nickname</label>
+        <div class="nick-field">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 2 20 12 12 22 4 12Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+            <path d="M12 7v10M8.5 12h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+          <input id="nickname" name="nickname" type="text" maxlength="16" autocomplete="nickname"
+                 spellcheck="false" enterkeyhint="go" placeholder="Enter your name">
+        </div>
+      </div>
+
+      <div class="slot slot-hero">
+        <div class="hero-chip" id="hero-chip" tabindex="0">
+          <span class="hero-portrait" id="hero-portrait"></span>
+          <span class="hero-text">
+            <span class="field-label">Selected Hero</span>
+            <span class="hero-name" id="hero-name">Aether Knight</span>
+            <span class="hero-meta">
+              <span id="hero-role">Melee Vanguard</span>
+              <span class="keycaps" id="hero-keys" aria-hidden="true"></span>
+            </span>
+          </span>
+        </div>
+      </div>
+
+      <div class="slot slot-deck">
+        <div class="deck-meta">
+          <span class="field-label">Selected Deck</span>
+          <span class="deck-count" id="deck-count">6 Cards</span>
+          <span class="deck-avg"><i class="elixir-drop" aria-hidden="true"></i><span id="deck-avg">–</span> Avg Elixir</span>
+        </div>
+        <ul class="deck" id="deck" aria-label="Selected deck"></ul>
+      </div>
+    </header>
+
+    <main class="stage">
+      <div class="emblem-row">
+        <div class="faction radiant">
+          <span class="faction-name">Radiant</span>
+          <span class="faction-desc">Crystal Sanctum · Left</span>
+        </div>
+        <div class="emblem-slot" id="emblem-slot" role="img" aria-label="Split Radiant and Dire emblem"></div>
+        <div class="faction dire">
+          <span class="faction-name">Dire</span>
+          <span class="faction-desc">Molten Obsidian · Right</span>
+        </div>
+      </div>
+
+      <h1 class="title">RuneDeck</h1>
+      <p class="tagline"><span>Tactical Lane Battler</span></p>
+
+      <div class="cta">
+        <button class="btn btn-find" id="btn-find" type="button" disabled>
+          <span class="btn-face">Find Match</span>
+        </button>
+      </div>
+      <p class="mode-line" id="mode-line">1v1 real-time PvP · An AI challenger takes the field if no rival appears within 60 seconds</p>
+    </main>
+
+    <footer class="statusbar">
+      <span class="conn" id="conn" data-state="connecting"><i class="conn-dot" aria-hidden="true"></i><span id="conn-text">Connecting to server…</span></span>
+      <span class="stats" id="lobby-stats" aria-live="polite"></span>
+      <span class="build">RuneDeck v0.1.0</span>
+    </footer>
+  </div>
+
+  <!-- ===================================================== Matchmaking queue -->
+  <div class="overlay" id="queue-modal" role="dialog" aria-modal="true" aria-labelledby="queue-title" hidden>
+    <div class="modal glass queue-panel" id="queue-panel">
+      <h2 class="modal-title" id="queue-title">Searching for Opponent</h2>
+
+      <div class="queue-ring">
+        <svg viewBox="0 0 200 200" aria-hidden="true">
+          <circle class="ring-runes" cx="100" cy="100" r="97"/>
+          <circle class="ring-track" cx="100" cy="100" r="88"/>
+          <circle class="ring-progress" id="queue-progress" cx="100" cy="100" r="88"/>
+          <circle class="ring-inner" cx="100" cy="100" r="76"/>
+        </svg>
+        <div class="queue-readout">
+          <span class="queue-timer" id="queue-timer" role="timer">00:00</span>
+          <span class="queue-limit" id="queue-limit">/ 01:00</span>
+        </div>
+      </div>
+
+      <p class="queue-status" id="queue-status" aria-live="polite">Entering the matchmaking queue…</p>
+      <p class="queue-hint" id="queue-hint">If no challenger answers by <strong>01:00</strong>, an AI opponent takes the field.</p>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-cancel" type="button">Cancel Search</button>
+        <button class="btn btn-dev" id="btn-spawn-bot" type="button">[DEV] Spawn Bot Immediately</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================================================== Match found -->
+  <div class="overlay overlay-match" id="match-overlay" role="dialog" aria-modal="true" aria-labelledby="match-title" hidden>
+    <div class="versus">
+      <h2 class="versus-title" id="match-title">Match Found</h2>
+      <p class="versus-sub" id="match-mode">1v1 · PvP</p>
+
+      <div class="versus-row">
+        <section class="side-card radiant" id="side-radiant">
+          <span class="side-label">Radiant · Left</span>
+          <span class="side-sigil" id="sigil-radiant"></span>
+          <strong class="side-name" id="name-radiant"></strong>
+          <span class="side-tag" id="tag-radiant"></span>
+          <span class="side-hero">Aether Knight</span>
+        </section>
+        <div class="versus-vs" aria-hidden="true">VS</div>
+        <section class="side-card dire" id="side-dire">
+          <span class="side-label">Dire · Right</span>
+          <span class="side-sigil" id="sigil-dire"></span>
+          <strong class="side-name" id="name-dire"></strong>
+          <span class="side-tag" id="tag-dire"></span>
+          <span class="side-hero">Aether Knight</span>
+        </section>
+      </div>
+
+      <p class="match-status" aria-live="polite"><span id="match-status-label">Battle begins in</span> <b id="match-count">5</b></p>
+      <p class="match-note" id="match-note"></p>
+      <button class="btn btn-ghost" id="btn-leave" type="button">Return to Lobby</button>
+    </div>
+  </div>
+
+  <!-- ===================================================== In-game: battlefield and HUD -->
+  <div class="game" id="game" hidden>
+    <canvas class="battlefield" id="battlefield"></canvas>
+    <div class="world-layer" id="world-layer" aria-hidden="true"></div>
+
+    <div class="hud" id="hud">
+      <header class="hud-top glass" id="hud-top">
+        <div class="team radiant" id="team-radiant">
+          <span class="team-crest"></span>
+          <div class="team-body">
+            <div class="team-head"><span class="team-name">Radiant</span><span class="team-player"></span></div>
+            <div class="team-bar" title="Radiant total structure health"><i class="bar-ghost"></i><i class="bar-fill"></i><b class="bar-text"></b></div>
+          </div>
+        </div>
+        <div class="clock">
+          <span class="clock-time" id="hud-timer" role="timer" aria-label="Match time remaining">03:30</span>
+          <span class="clock-rune" id="hud-rune" title="Time until the next River Rune spawns"><i class="rune-gem"></i><span id="hud-rune-text">Rune 0:30</span></span>
+        </div>
+        <div class="team dire" id="team-dire">
+          <span class="team-crest"></span>
+          <div class="team-body">
+            <div class="team-head"><span class="team-name">Dire</span><span class="team-player"></span></div>
+            <div class="team-bar" title="Dire total structure health"><i class="bar-ghost"></i><i class="bar-fill"></i><b class="bar-text"></b></div>
+          </div>
+        </div>
+      </header>
+
+      <button class="hud-leave" id="btn-leave-match" type="button">Leave Match</button>
+
+      <ol class="feed" id="feed" aria-live="polite" aria-label="Combat feed"></ol>
+
+      <section class="hero-panel glass" id="hero-panel" aria-label="Hero">
+        <div class="hero-id">
+          <div class="portrait"><img id="hud-portrait" alt="Aether Knight"><span class="respawn" id="hud-respawn" title="Seconds until your hero respawns"></span><span class="level" id="hud-level" title="Hero level">1</span></div>
+          <div class="gold" title="Gold"><i class="coin"></i><span id="hud-gold">0</span></div>
+        </div>
+        <div class="hero-main">
+          <div class="hero-title"><strong id="hud-hero-name">Aether Knight</strong><span id="hud-player-name"></span></div>
+          <div class="stat hp" id="stat-hp" title="Health"><i class="stat-ghost"></i><i class="stat-fill"></i><b></b></div>
+          <div class="stat mana" id="stat-mana" title="Mana"><i class="stat-fill"></i><b></b></div>
+          <div class="skills">
+            <div class="abilities" id="abilities" aria-label="Abilities"></div>
+            <div class="items" id="items" aria-label="Items"></div>
+          </div>
+        </div>
+      </section>
+
+      <p class="hint" id="hint" role="status"></p>
+
+      <aside class="hud-right">
+        <div class="minimap glass"><canvas id="minimap" aria-label="Tactical minimap"></canvas></div>
+        <section class="dock glass" id="dock" aria-label="Card dock">
+          <div class="dock-cards">
+            <div class="hand" id="hand"></div>
+            <div class="next"><span class="next-label">Next</span><div id="next-card"></div></div>
+          </div>
+          <div class="elixir" title="Elixir">
+            <span class="elixir-badge"><b id="elixir-count">0</b></span>
+            <div class="elixir-track" id="elixir-track"></div>
+          </div>
+        </section>
+      </aside>
+
+      <div class="card-ghost" id="card-ghost" hidden></div>
+
+      <div class="result" id="result" role="dialog" aria-modal="true" aria-labelledby="result-title" hidden>
+        <div class="result-card glass">
+          <h2 class="result-title" id="result-title"></h2>
+          <p class="result-detail" id="result-detail"></p>
+          <button class="btn btn-ghost" id="btn-result" type="button">Return to Lobby</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+  <div class="tooltip glass" id="tooltip" role="tooltip"></div>
+
+  <noscript><p class="noscript">RuneDeck needs JavaScript enabled to run.</p></noscript>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module" src="client.js"></script>
+</body>
+</html>
